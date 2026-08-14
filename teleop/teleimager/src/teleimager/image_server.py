@@ -896,6 +896,10 @@ class BaseCamera:
         jpeg_bytes = self._zmq_buffer.read() if self._zmq_buffer else None
         return jpeg_bytes
 
+    def get_zmq_packet(self):
+        """Return latest ``(sequence, capture_monotonic_ns, payload)``."""
+        return self._zmq_buffer.read_packet() if self._zmq_buffer else None
+
     def get_bgr_frame(self):
         bgr_numpy = self._webrtc_buffer.read() if self._enable_webrtc and self._webrtc_buffer else None
         return bgr_numpy
@@ -1866,7 +1870,11 @@ class ImageServer:
         interval = 1.0 / max(1.0, fps)
         frame_id = 0
         empty_count = 0
+        unsynced_count = 0
+        last_color_sequence = -1
+        last_depth_sequence = -1
         max_empty_frames = max(3, int(fps * self._camera_failure_timeout))
+        max_pair_skew_ns = int(max(0.1, 2.0 * interval) * 1_000_000_000)
         next_frame_time = time.monotonic()
 
         logger_mp.info(
@@ -1877,29 +1885,63 @@ class ImageServer:
                 color_camera = self._cameras.get(color_topic)
                 depth_camera = self._cameras.get(depth_topic)
 
-            color_jpeg = color_camera.get_jpeg_bytes() if color_camera is not None else None
-            depth_bytes = depth_camera.get_jpeg_bytes() if depth_camera is not None else None
+            color_packet = color_camera.get_zmq_packet() if color_camera is not None else None
+            depth_packet = depth_camera.get_zmq_packet() if depth_camera is not None else None
 
-            if color_jpeg is not None and depth_bytes is not None:
+            if color_packet is not None and depth_packet is not None:
                 empty_count = 0
-                frame_id += 1
-                metadata = {
-                    "stream": stream_topic,
-                    "data_format": "rgbd",
-                    "frame_id": frame_id,
-                    "timestamp_ns": time.time_ns(),
-                    "color_camera": color_topic,
-                    "depth_camera": depth_topic,
-                    "color_format": "jpeg",
-                    "depth_format": "depth_z16",
-                    "color_shape": color_camera.get_img_shape(),
-                    "depth_shape": depth_camera.get_img_shape(),
-                    "depth_dtype": stream_cfg.get("depth_dtype", "uint16"),
-                }
-                self._zmq_publisher_manager.publish(
-                    (json.dumps(metadata).encode("utf-8"), color_jpeg, depth_bytes),
-                    port,
+                color_sequence, color_timestamp_ns, color_jpeg = color_packet
+                depth_sequence, depth_timestamp_ns, depth_bytes = depth_packet
+                both_new = (
+                    color_sequence != last_color_sequence
+                    and depth_sequence != last_depth_sequence
                 )
+                pair_skew_ns = abs(color_timestamp_ns - depth_timestamp_ns)
+                if both_new and pair_skew_ns <= max_pair_skew_ns:
+                    unsynced_count = 0
+                    frame_id += 1
+                    metadata = {
+                        "stream": stream_topic,
+                        "data_format": "rgbd",
+                        "frame_id": frame_id,
+                        "timestamp_ns": time.time_ns(),
+                        "color_camera": color_topic,
+                        "depth_camera": depth_topic,
+                        "color_format": "jpeg",
+                        "depth_format": "depth_z16",
+                        "color_shape": color_camera.get_img_shape(),
+                        "depth_shape": depth_camera.get_img_shape(),
+                        "depth_dtype": stream_cfg.get("depth_dtype", "uint16"),
+                        "color_frame_sequence": color_sequence,
+                        "depth_frame_sequence": depth_sequence,
+                        "color_capture_monotonic_ns": color_timestamp_ns,
+                        "depth_capture_monotonic_ns": depth_timestamp_ns,
+                        "capture_skew_ms": pair_skew_ns / 1_000_000.0,
+                    }
+                    self._zmq_publisher_manager.publish(
+                        (json.dumps(metadata).encode("utf-8"), color_jpeg, depth_bytes),
+                        port,
+                    )
+                    last_color_sequence = color_sequence
+                    last_depth_sequence = depth_sequence
+                elif both_new:
+                    unsynced_count += 1
+                    if unsynced_count == 1 or unsynced_count % max(1, int(fps)) == 0:
+                        logger_mp.warning(
+                            f"[Image Server] RGBD stream {stream_topic} waiting for "
+                            f"synchronized frames: color_seq={color_sequence}, "
+                            f"depth_seq={depth_sequence}, skew={pair_skew_ns / 1_000_000.0:.1f}ms "
+                            f"(limit={max_pair_skew_ns / 1_000_000.0:.1f}ms)."
+                        )
+                else:
+                    unsynced_count += 1
+                    if unsynced_count % max(1, int(fps)) == 0:
+                        logger_mp.warning(
+                            f"[Image Server] RGBD stream {stream_topic} waiting for "
+                            f"new source frames: color_seq={color_sequence} "
+                            f"(last={last_color_sequence}), depth_seq={depth_sequence} "
+                            f"(last={last_depth_sequence})."
+                        )
             else:
                 empty_count += 1
                 if empty_count == 1 or empty_count % max(1, int(fps)) == 0:

@@ -40,25 +40,42 @@ logger_mp.setLevel(logging_mp.INFO)
 class TripleRingBuffer:
     def __init__(self):
         self.buffer = [None, None, None]
+        self.sequence_buffer = [-1, -1, -1]
+        self.timestamp_buffer = [None, None, None]
+        self.sequence = 0
         self.write_index = 0            # Index where the next write will occur
         self.latest_index = -1          # Index of the latest written data
         self.read_index = -1            # Index of the current read data
         self.lock = threading.Lock()
 
-    def write(self, data):
+    def write(self, data, timestamp_ns=None):
         with self.lock:
+            self.sequence += 1
             self.buffer[self.write_index] = data
+            self.sequence_buffer[self.write_index] = self.sequence
+            self.timestamp_buffer[self.write_index] = (
+                time.monotonic_ns() if timestamp_ns is None else int(timestamp_ns)
+            )
             self.latest_index = self.write_index
             self.write_index = (self.write_index + 1) % 3
             if self.write_index == self.read_index:
                 self.write_index = (self.write_index + 1) % 3
 
     def read(self):
+        packet = self.read_packet()
+        return None if packet is None else packet[2]
+
+    def read_packet(self):
+        """Return ``(sequence, monotonic_timestamp_ns, data)`` for latest write."""
         with self.lock:
             if self.latest_index == -1:
                 return None  # No data has been written yet
             self.read_index = self.latest_index
-        return self.buffer[self.read_index]
+            return (
+                self.sequence_buffer[self.read_index],
+                self.timestamp_buffer[self.read_index],
+                self.buffer[self.read_index],
+            )
 
 class SimpleFPSMonitor:
     def __init__(self, window_size: int):
