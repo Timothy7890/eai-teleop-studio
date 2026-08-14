@@ -1,8 +1,9 @@
 import json
+import tarfile
+import time
 import types
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -149,7 +150,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(progress["next_episode"], "episode_0011")
         self.assertTrue(progress["resuming"])
 
-    def test_archive_task_creates_dated_zip_and_persists_metadata(self):
+    def test_archive_task_creates_dated_targz_and_persists_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manager = TeleopManager(root / "datasets", root / "console.json")
@@ -159,6 +160,7 @@ class ValidationTests(unittest.TestCase):
                 "network_interface": "eth0",
             })
             state = manager.create_task({
+                "instruction": "pick up the red cup",
                 "name": "pick_red_cup", "description": "拾取红色水杯", "target_episodes": 10,
             })
             episode_dir = root / "datasets" / "pick_red_cup" / "episode_0001"
@@ -166,12 +168,17 @@ class ValidationTests(unittest.TestCase):
             (episode_dir / "data.json").write_text('{"data": [\n]\n}', encoding="utf-8")
 
             archived = manager.archive_task(state["tasks"][0]["id"])
-            archive_path = Path(archived["archive"]["path"])
+            archive_path = Path(archived["archive_job"]["archive_path"])
+            for _ in range(50):
+                persisted = manager.state()["tasks"][0]
+                if not persisted["archive_status"]["running"]:
+                    break
+                time.sleep(0.05)
             persisted = manager.state()["tasks"][0]
-            with zipfile.ZipFile(archive_path) as archive:
-                members = archive.namelist()
+            with tarfile.open(archive_path, "r:gz") as archive:
+                members = archive.getnames()
 
-        self.assertRegex(archive_path.name, r"^pick_red_cup_\d{8}_\d{6}\.zip$")
+        self.assertRegex(archive_path.name, r"^pick_red_cup_\d{8}_\d{6}\.tar\.gz$")
         self.assertIn("pick_red_cup/episode_0001/data.json", members)
         self.assertEqual(persisted["last_archive"], str(archive_path))
         self.assertTrue(persisted["archived_at"])

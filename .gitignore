@@ -1,0 +1,17 @@
+# Local hidden files/directories
+.*
+
+# Keep important repo hidden files if needed
+!.gitignore
+!.github/
+!.gitmodules
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+
+# Codex local temp files
+.codex_*

@@ -862,10 +862,7 @@ class BaseCamera:
         self._fps = fps
         self._enable_zmq = enable_zmq
         self._zmq_port = zmq_port
-        if self._enable_zmq:
-            self._zmq_buffer = TripleRingBuffer()
-        else:
-            self._zmq_buffer = None
+        self._zmq_buffer = TripleRingBuffer()
 
         self._enable_webrtc = enable_webrtc
         self._webrtc_port = webrtc_port
@@ -896,7 +893,7 @@ class BaseCamera:
         return self._enable_zmq
 
     def get_jpeg_bytes(self):
-        jpeg_bytes = self._zmq_buffer.read() if self._enable_zmq and self._zmq_buffer else None
+        jpeg_bytes = self._zmq_buffer.read() if self._zmq_buffer else None
         return jpeg_bytes
 
     def get_bgr_frame(self):
@@ -911,6 +908,10 @@ class BaseCamera:
     def get_zmq_port(self):
         """Return the zmq port number the camera is serving on."""
         return self._zmq_port
+
+    def get_img_shape(self):
+        """Return the configured image shape as [height, width]."""
+        return list(self._img_shape) if self._img_shape is not None else None
     
     def get_webrtc_port(self):
         """Return the webrtc port number the camera is serving on."""
@@ -1202,8 +1203,7 @@ class OpenCVDepthCamera(BaseCamera):
             ret, frame = self.cap.read()
             if ret:
                 depth = self._normalize_depth_frame(frame)
-                if self._enable_zmq:
-                    self._zmq_buffer.write(depth.tobytes())
+                self._zmq_buffer.write(depth.tobytes())
 
                 if not self._ready.is_set():
                     self._ready.set()
@@ -1303,8 +1303,7 @@ class FFmpegDepthCamera(BaseCamera):
         if frame_bytes is None:
             raise RuntimeError
 
-        if self._enable_zmq:
-            self._zmq_buffer.write(frame_bytes)
+        self._zmq_buffer.write(frame_bytes)
 
         if not self._ready.is_set():
             self._ready.set()
@@ -1466,16 +1465,45 @@ class ImageServer:
         self._cleaned = False
         self._hotplug_thread = None
         self._last_offline_log = {}
+        self._rgbd_inline_depth_topics = {}
+        rgbd_inline_depth_configs = {}
+        for stream_topic, cfg in self._cam_config.items():
+            if not isinstance(cfg, dict) or cfg.get("type", "uvc").lower() != "rgbd" or not cfg.get("enable_zmq", False):
+                continue
+            if cfg.get("depth_camera"):
+                continue
+            depth_cfg = cfg.get("depth")
+            if not isinstance(depth_cfg, dict):
+                continue
+            depth_topic = f"__{stream_topic}_depth"
+            internal_depth_cfg = dict(depth_cfg)
+            internal_depth_cfg["type"] = internal_depth_cfg.get("type", "opencv_depth")
+            internal_depth_cfg["data_format"] = internal_depth_cfg.get("data_format", "depth_z16")
+            internal_depth_cfg["enable_zmq"] = False
+            internal_depth_cfg["zmq_port"] = None
+            internal_depth_cfg["enable_webrtc"] = False
+            internal_depth_cfg["webrtc_port"] = None
+            self._rgbd_inline_depth_topics[stream_topic] = depth_topic
+            rgbd_inline_depth_configs[depth_topic] = internal_depth_cfg
+        self._rgbd_dependency_topics = {
+            topic
+            for cfg in self._cam_config.values()
+            if isinstance(cfg, dict) and cfg.get("type", "uvc").lower() == "rgbd" and cfg.get("enable_zmq", False)
+            for topic in (cfg.get("color_camera"), cfg.get("depth_camera"))
+            if topic
+        }
         try:
             self._camera_failure_timeout = max(0.5, float(os.environ.get("XR_TELEOP_CAMERA_FAILURE_TIMEOUT", "2.0")))
         except ValueError:
             self._camera_failure_timeout = 2.0
         if not self._isaacsim_enable:
             enabled_configs = [
-                cfg for cfg in self._cam_config.values()
+                cfg for topic, cfg in self._cam_config.items()
                 if isinstance(cfg, dict)
-                and (cfg.get("enable_zmq", False) or cfg.get("enable_webrtc", False))
+                and cfg.get("type", "uvc").lower() != "rgbd"
+                and (cfg.get("enable_zmq", False) or cfg.get("enable_webrtc", False) or topic in self._rgbd_dependency_topics)
             ]
+            enabled_configs.extend(rgbd_inline_depth_configs.values())
             needs_camera_finder = any(
                 not (cfg.get("type", "uvc").lower() == "opencv" and cfg.get("direct_video_id", False))
                 for cfg in enabled_configs
@@ -1489,7 +1517,11 @@ class ImageServer:
         try:
             # Load cameras from self.cam_config
             for cam_topic, cam_cfg in self._cam_config.items():
-                if not cam_cfg.get("enable_zmq", False) and not cam_cfg.get("enable_webrtc", False):
+                if (
+                    not cam_cfg.get("enable_zmq", False)
+                    and not cam_cfg.get("enable_webrtc", False)
+                    and cam_topic not in self._rgbd_dependency_topics
+                ):
                     continue
 
                 enable_zmq = cam_cfg.get("enable_zmq", False)
@@ -1499,6 +1531,8 @@ class ImageServer:
                 webrtc_codec = cam_cfg.get("webrtc_codec", None)
                 fourcc = str(cam_cfg.get("fourcc", "MJPG")).upper()
                 cam_type = cam_cfg.get("type", "uvc").lower()
+                if cam_type == "rgbd":
+                    continue
                 if self._isaacsim_enable and cam_type!="isaacsim":
                     cam_type = "isaacsim"
                 img_shape = cam_cfg.get("image_shape", None)
@@ -1696,6 +1730,13 @@ class ImageServer:
                 else:
                     logger_mp.error(f"[Image Server] Unknown camera type {cam_type} for {cam_topic}, skipping...")
                     continue
+            for depth_topic, depth_cfg in rgbd_inline_depth_configs.items():
+                camera = self._create_direct_opencv_camera(depth_topic, depth_cfg)
+                if camera is None:
+                    self._cameras[depth_topic] = None
+                    logger_mp.warning(f"[Image Server] RGBD internal depth camera {depth_topic} is offline; waiting for recovery.")
+                else:
+                    self._cameras[depth_topic] = camera
         except Exception as e:
             logger_mp.error(f"[Image Server] Initialization failed: {e}")
             self._clean_up()
@@ -1817,6 +1858,65 @@ class ImageServer:
         except Exception as e:
             self._mark_camera_offline(cam_topic, camera, f"WebRTC publisher failed: {e}")
 
+    def _rgbd_pub(self, stream_topic: str, stream_cfg: dict):
+        color_topic = stream_cfg.get("color_camera", "head_camera")
+        depth_topic = stream_cfg.get("depth_camera") or self._rgbd_inline_depth_topics.get(stream_topic) or "head_depth_camera"
+        port = stream_cfg.get("zmq_port")
+        fps = float(stream_cfg.get("fps", 30))
+        interval = 1.0 / max(1.0, fps)
+        frame_id = 0
+        empty_count = 0
+        max_empty_frames = max(3, int(fps * self._camera_failure_timeout))
+        next_frame_time = time.monotonic()
+
+        logger_mp.info(
+            f"[Image Server] RGBD stream {stream_topic} publishing {color_topic}+{depth_topic} on ZMQ port {port}."
+        )
+        while not self._stop_event.is_set():
+            with self._camera_state_lock:
+                color_camera = self._cameras.get(color_topic)
+                depth_camera = self._cameras.get(depth_topic)
+
+            color_jpeg = color_camera.get_jpeg_bytes() if color_camera is not None else None
+            depth_bytes = depth_camera.get_jpeg_bytes() if depth_camera is not None else None
+
+            if color_jpeg is not None and depth_bytes is not None:
+                empty_count = 0
+                frame_id += 1
+                metadata = {
+                    "stream": stream_topic,
+                    "data_format": "rgbd",
+                    "frame_id": frame_id,
+                    "timestamp_ns": time.time_ns(),
+                    "color_camera": color_topic,
+                    "depth_camera": depth_topic,
+                    "color_format": "jpeg",
+                    "depth_format": "depth_z16",
+                    "color_shape": color_camera.get_img_shape(),
+                    "depth_shape": depth_camera.get_img_shape(),
+                    "depth_dtype": stream_cfg.get("depth_dtype", "uint16"),
+                }
+                self._zmq_publisher_manager.publish(
+                    (json.dumps(metadata).encode("utf-8"), color_jpeg, depth_bytes),
+                    port,
+                )
+            else:
+                empty_count += 1
+                if empty_count == 1 or empty_count % max(1, int(fps)) == 0:
+                    logger_mp.warning(
+                        f"[Image Server] RGBD stream {stream_topic} waiting for frames "
+                        f"from {color_topic}/{depth_topic} ({empty_count}/{max_empty_frames})."
+                    )
+                if empty_count >= max_empty_frames:
+                    empty_count = 0
+
+            next_frame_time += interval
+            sleep_time = next_frame_time - time.monotonic()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                next_frame_time = time.monotonic()
+
 
     def _activate_camera(self, cam_topic: str, camera: BaseCamera) -> bool:
         with self._camera_state_lock:
@@ -1897,7 +1997,11 @@ class ImageServer:
             for cam_topic, cam_cfg in self._cam_config.items():
                 if not isinstance(cam_cfg, dict):
                     continue
-                if not (cam_cfg.get("enable_zmq", False) or cam_cfg.get("enable_webrtc", False)):
+                if not (
+                    cam_cfg.get("enable_zmq", False)
+                    or cam_cfg.get("enable_webrtc", False)
+                    or cam_topic in self._rgbd_dependency_topics
+                ):
                     continue
                 if cam_cfg.get("type", "uvc").lower() not in {"opencv", "opencv_depth"} or not cam_cfg.get("direct_video_id", False):
                     continue
@@ -1957,6 +2061,18 @@ class ImageServer:
                 continue
             if self._activate_camera(camera_topic, camera):
                 active_count += 1
+        for stream_topic, stream_cfg in self._cam_config.items():
+            if not isinstance(stream_cfg, dict):
+                continue
+            if stream_cfg.get("type", "uvc").lower() != "rgbd" or not stream_cfg.get("enable_zmq", False):
+                continue
+            thread = threading.Thread(
+                target=self._rgbd_pub,
+                args=(stream_topic, stream_cfg),
+                daemon=True,
+            )
+            thread.start()
+            self._publisher_threads.append(thread)
         if self._isaacsim_enable:
             time.sleep(2.0)  # wait a bit for IsaacSim shared memory to be ready
         self._hotplug_thread = threading.Thread(target=self._hotplug_monitor, daemon=True)

@@ -533,6 +533,7 @@ if __name__ == '__main__':
             for camera_name in XR_QUAD_CAMERA_ORDER
             if isinstance(camera_config.get(camera_name), dict)
             and camera_config[camera_name].get('enable_zmq')
+            and camera_config[camera_name].get('data_format', 'jpeg') == 'jpeg'
         ]
         if xr_quad_view and not xr_camera_names:
             logger_mp.warning("XR quad view requested, but no ZMQ camera is enabled. Falling back to head view.")

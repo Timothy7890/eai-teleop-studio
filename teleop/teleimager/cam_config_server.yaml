@@ -1,6 +1,6 @@
-# Capture configuration for the x86 camera box at 192.168.123.5.
-# Device mapping was inspected and frame-tested on 2026-06-22.
-
+# Capture configuration generated from V4L2 discovery.
+# Device mapping was inspected on 2026-08-12.
+# Stable selector = serial_number + usb_interface + video_index.
 head_camera:
   enable_zmq: true
   zmq_port: 55555
@@ -12,32 +12,38 @@ head_camera:
   direct_video_id: true
   usb_interface: "1.4"
   video_index: 0
-  image_shape: [480, 640]
+  image_shape: [1080, 1920]
   binocular: false
   fps: 30
   video_id: null
-  serial_number: CP0BB53000FS
+  serial_number: "CP0BB53000FS"
   physical_path: null
 
-head_depth_camera:
+head_rgbd_camera:
   enable_zmq: true
-  zmq_port: 55559
-  enable_webrtc: false
+  zmq_port: 55560
+  enable_webrtc: true
   webrtc_port: null
-  type: opencv_depth
-  data_format: depth_z16
-  fourcc: "Z16 "
-  ffmpeg_input_format: gray16le
+  type: rgbd
+  data_format: rgbd
+  color_camera: "head_camera"
   depth_dtype: uint16
-  direct_video_id: true
-  usb_interface: "1.0"
-  video_index: 0
-  image_shape: [480, 640]
-  binocular: false
   fps: 30
-  video_id: null
-  serial_number: CP0BB53000FS
-  physical_path: null
+  depth:
+    type: opencv_depth
+    data_format: depth_z16
+    fourcc: "Z16 "
+    ffmpeg_input_format: gray16le
+    depth_dtype: uint16
+    direct_video_id: true
+    usb_interface: "1.0"
+    video_index: 0
+    image_shape: [800, 1280]
+    binocular: false
+    fps: 30
+    video_id: null
+    serial_number: "CP0BB53000FS"
+    physical_path: null
 
 torso_camera:
   enable_zmq: true
@@ -54,7 +60,7 @@ torso_camera:
   binocular: false
   fps: 30
   video_id: null
-  serial_number: CPCBC530002E
+  serial_number: "CP0F463000WM"
   physical_path: null
 
 left_wrist_camera:
@@ -68,11 +74,11 @@ left_wrist_camera:
   direct_video_id: true
   usb_interface: "1.4"
   video_index: 0
-  image_shape: [480, 640]
+  image_shape: [1080, 1920]
   binocular: false
   fps: 30
   video_id: null
-  serial_number: CP0F463000HS
+  serial_number: "CP0X663000D0"
   physical_path: null
 
 right_wrist_camera:
@@ -86,9 +92,9 @@ right_wrist_camera:
   direct_video_id: true
   usb_interface: "1.4"
   video_index: 0
-  image_shape: [480, 640]
+  image_shape: [1080, 1920]
   binocular: false
   fps: 30
   video_id: null
-  serial_number: CP06563000E6
+  serial_number: "CP0T26300058"
   physical_path: null

@@ -1,0 +1,11 @@
+2026-08-12 15:41:48 [INFO] teleop web manager initialized {"config_file": "/home/robot/eai-teleop-studio/config/web_console.json", "dataset_root": "/home/robot/data/datasets/robot", "log_dir": "/home/robot/eai-teleop-studio/logs", "postprocess_state_file": "/home/robot/data/datasets/robot/postprocess_state.json", "task_file": "/home/robot/data/datasets/robot/tasks.json"}
+2026-08-12 15:41:48 [INFO] teleop web server started {"config_file": "/home/robot/eai-teleop-studio/config/web_console.json", "dataset_root": "/home/robot/data/datasets/robot", "host": "0.0.0.0", "log_dir": "/home/robot/eai-teleop-studio/logs", "port": 18099, "task_file": "/home/robot/data/datasets/robot/tasks.json"}
+2026-08-12 16:27:24 [INFO] teleop web manager initialized {"config_file": "/home/robot/eai-teleop-studio/config/web_console.json", "dataset_root": "/home/robot/data/datasets/robot", "log_dir": "/home/robot/eai-teleop-studio/logs", "postprocess_state_file": "/home/robot/data/datasets/robot/postprocess_state.json", "task_file": "/home/robot/data/datasets/robot/tasks.json"}
+2026-08-12 16:27:24 [INFO] teleop web server started {"config_file": "/home/robot/eai-teleop-studio/config/web_console.json", "dataset_root": "/home/robot/data/datasets/robot", "host": "0.0.0.0", "log_dir": "/home/robot/eai-teleop-studio/logs", "port": 18099, "task_file": "/home/robot/data/datasets/robot/tasks.json"}
+2026-08-12 16:31:09 [ACCESS] http request {"client": "192.168.7.33", "duration_ms": 1.2, "method": "GET", "path": "/index.html", "status": 200}
+2026-08-12 16:31:09 [ACCESS] http request {"client": "192.168.7.33", "duration_ms": 1.0, "method": "GET", "path": "/styles.css", "status": 200}
+2026-08-12 16:31:09 [ACCESS] http request {"client": "192.168.7.33", "duration_ms": 0.7, "method": "GET", "path": "/device.css", "status": 200}
+2026-08-12 16:31:09 [ACCESS] http request {"client": "192.168.7.33", "duration_ms": 8.0, "method": "GET", "path": "/app.js", "status": 200}
+2026-08-12 16:31:09 [WARNING] http request {"client": "192.168.7.33", "duration_ms": 0.2, "method": "GET", "path": "/favicon.ico", "status": 404}
+2026-08-12 16:31:15 [INFO] http post received {"client": "192.168.7.33", "path": "/api/data/list"}
+2026-08-12 16:31:15 [ACCESS] http request {"client": "192.168.7.33", "duration_ms": 0.7, "method": "POST", "path": "/api/data/list", "status": 200}

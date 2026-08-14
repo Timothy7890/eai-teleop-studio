@@ -21,6 +21,7 @@
 import cv2
 import time
 import contextlib
+import json
 import queue
 import threading
 from typing import Any, Dict, Optional, Tuple
@@ -120,7 +121,11 @@ class ZMQ_PublisherThread(threading.Thread):
         Args:
             data: The data to publish
         """
-        if not isinstance(data, (bytes, bytearray, memoryview)):
+        if isinstance(data, (list, tuple)):
+            if not all(isinstance(part, (bytes, bytearray, memoryview)) for part in data):
+                raise TypeError(f"PublisherThread expects multipart bytes, got {type(data)}")
+            data = tuple(bytes(part) for part in data)
+        elif not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError(f"PublisherThread expects bytes, got {type(data)}")
 
         try:
@@ -161,7 +166,10 @@ class ZMQ_PublisherThread(threading.Thread):
                         break
 
                     try:
-                        self._socket.send(data, zmq.NOBLOCK)
+                        if isinstance(data, tuple):
+                            self._socket.send_multipart(data, zmq.NOBLOCK)
+                        else:
+                            self._socket.send(data, zmq.NOBLOCK)
                     except zmq.Again:
                         logger_mp.warning(f"High water mark reached for at {self._host}:{self._port}, dropping message")
                     except zmq.ZMQError as e:
@@ -346,6 +354,55 @@ class TeleDepth:
         size = len(self.raw) if self.raw else 0
         state = "OK" if self._depth is not None else "EMPTY"
         return f"TeleDepth(fps={self.fps:.1f}, raw_byte_size={size}, depth_state={state})"
+
+
+class TeleRGBD:
+    __slots__ = ['metadata', 'rgb_jpg', 'depth_raw', '_bgr', '_depth', 'fps']
+
+    def __init__(
+        self,
+        fps: float,
+        metadata: Optional[Dict[str, Any]],
+        rgb_jpg: Optional[bytes],
+        depth_raw: Optional[bytes],
+        bgr: Optional[np.ndarray],
+        depth: Optional[np.ndarray],
+    ):
+        self.fps = fps
+        self.metadata = metadata
+        self.rgb_jpg = rgb_jpg
+        self.depth_raw = depth_raw
+        self._bgr = bgr
+        self._depth = depth
+
+    @property
+    def bgr(self) -> Optional[np.ndarray]:
+        return self._bgr
+
+    @property
+    def depth(self) -> Optional[np.ndarray]:
+        return self._depth
+
+    def __bool__(self):
+        return self.rgb_jpg is not None and self.depth_raw is not None
+
+    def __iter__(self):
+        yield self.fps
+        yield self.metadata
+        yield self.rgb_jpg
+        yield self.depth_raw
+        yield self._bgr
+        yield self._depth
+
+    def __repr__(self):
+        rgb_size = len(self.rgb_jpg) if self.rgb_jpg else 0
+        depth_size = len(self.depth_raw) if self.depth_raw else 0
+        bgr_state = "OK" if self._bgr is not None else "EMPTY"
+        depth_state = "OK" if self._depth is not None else "EMPTY"
+        return (
+            f"TeleRGBD(fps={self.fps:.1f}, rgb_jpg_byte_size={rgb_size}, "
+            f"depth_raw_byte_size={depth_size}, bgr_state={bgr_state}, depth_state={depth_state})"
+        )
         
 
 class ZMQ_SubscriberThread(threading.Thread):
@@ -390,6 +447,7 @@ class ZMQ_SubscriberThread(threading.Thread):
 
         self._jpg_3ring_buffer = TripleRingBuffer()
         self._depth_3ring_buffer = TripleRingBuffer()
+        self._rgbd_3ring_buffer = TripleRingBuffer()
         self._fps_monitor = SimpleFPSMonitor(window_size=10)
         if self._request_bgr:
             self._bgr_3ring_buffer = TripleRingBuffer()
@@ -428,6 +486,28 @@ class ZMQ_SubscriberThread(threading.Thread):
             logger_mp.warning(f"[ZMQ_SubscriberThread] Failed to decode image: {e}")
             return None
 
+    def _decode_rgbd_parts(self, parts):
+        if not parts or len(parts) != 3:
+            return None
+        try:
+            metadata = json.loads(parts[0].decode("utf-8"))
+        except Exception as e:
+            logger_mp.warning(f"[ZMQ_SubscriberThread] Failed to decode RGBD metadata: {e}")
+            return None
+
+        rgb_jpg = parts[1]
+        depth_raw = parts[2]
+        depth_shape = tuple(metadata.get("depth_shape") or self._depth_shape or ())
+        if depth_shape:
+            previous_shape = self._depth_shape
+            self._depth_shape = depth_shape
+            depth = self._decode_depth(depth_raw)
+            self._depth_shape = previous_shape
+        else:
+            depth = self._decode_depth(depth_raw)
+        bgr = self._decode_image(rgb_jpg) if self._request_bgr else None
+        return metadata, rgb_jpg, depth_raw, bgr, depth
+
     def _decoder_loop(self):
         while self._running:
             try:
@@ -455,6 +535,12 @@ class ZMQ_SubscriberThread(threading.Thread):
         """
         current_fps = self._fps_monitor.fps
         jpg_data = self._jpg_3ring_buffer.read()
+        if self._data_format == "rgbd":
+            rgbd_data = self._rgbd_3ring_buffer.read()
+            if rgbd_data is None:
+                return TeleRGBD(current_fps, None, None, None, None, None)
+            metadata, rgb_jpg, depth_raw, bgr, depth = rgbd_data
+            return TeleRGBD(current_fps, metadata, rgb_jpg, depth_raw, bgr, depth)
         if self._data_format == "depth_z16":
             depth_data = self._depth_3ring_buffer.read()
             return TeleDepth(fps=current_fps, raw=jpg_data, depth=depth_data)
@@ -493,6 +579,17 @@ class ZMQ_SubscriberThread(threading.Thread):
                 if self._socket in events:
                     try:
                         # receive the latest message
+                        if self._data_format == "rgbd":
+                            parts = self._socket.recv_multipart()
+                            rgbd_data = self._decode_rgbd_parts(parts)
+                            if rgbd_data is None:
+                                continue
+                            self._rgbd_3ring_buffer.write(rgbd_data)
+                            self._last_message_at = time.monotonic()
+                            self._has_marked_stale = False
+                            self._fps_monitor.tick()
+                            continue
+
                         img_bytes = self._socket.recv()
                         # write to 3-ring-buffer
                         self._jpg_3ring_buffer.write(img_bytes)
@@ -522,6 +619,8 @@ class ZMQ_SubscriberThread(threading.Thread):
                             self._jpg_3ring_buffer.write(None)
                             if self._data_format == "depth_z16":
                                 self._depth_3ring_buffer.write(None)
+                            if self._data_format == "rgbd":
+                                self._rgbd_3ring_buffer.write(None)
                             if self._request_bgr:
                                 try:
                                     if self._bgr_decode_queue.full():
@@ -651,6 +750,19 @@ class ZMQ_SubscriberManager:
             request_bgr=False,
             data_format="depth_z16",
             depth_shape=depth_shape,
+            depth_dtype=depth_dtype,
+        )
+        return subscriber_thread.recv()
+
+    def subscribe_rgbd(self, host: str, port: int, request_bgr: bool = False, depth_dtype: str = "uint16") -> TeleRGBD:
+        if not self._running:
+            raise RuntimeError("SubscriberManager is closed.")
+
+        subscriber_thread = self._get_subscriber_thread(
+            host,
+            port,
+            request_bgr=request_bgr,
+            data_format="rgbd",
             depth_dtype=depth_dtype,
         )
         return subscriber_thread.recv()
@@ -826,14 +938,7 @@ class ImageClient:
         for camera_name, camera_cfg in self._cam_config.items():
             if not isinstance(camera_cfg, dict) or not camera_cfg.get('enable_zmq'):
                 continue
-            if camera_cfg.get("data_format") == "depth_z16":
-                self._subscriber_manager.subscribe_depth(
-                    self._host,
-                    camera_cfg['zmq_port'],
-                    tuple(camera_cfg["image_shape"]),
-                    camera_cfg.get("depth_dtype", "uint16"),
-                )
-            else:
+            if camera_cfg.get("data_format", "jpeg") == "jpeg":
                 self._subscriber_manager.subscribe(self._host, camera_cfg['zmq_port'], request_bgr=self._request_bgr)
 
         if not self._cam_config['head_camera']['enable_zmq'] and not self._cam_config['head_camera']['enable_webrtc']:
@@ -854,6 +959,8 @@ class ImageClient:
 
     def get_camera_frame(self, camera_name: str):
         camera_cfg = self._cam_config[camera_name]
+        if camera_cfg.get("data_format", "jpeg") != "jpeg":
+            raise ValueError(f"Camera '{camera_name}' is not a JPEG RGB stream; use get_depth_frame/get_rgbd_frame instead.")
         return self._subscriber_manager.subscribe(self._host, camera_cfg['zmq_port'], request_bgr=self._request_bgr)
 
     def get_depth_frame(self, camera_name: str = "head_depth_camera"):
@@ -865,11 +972,23 @@ class ImageClient:
             camera_cfg.get("depth_dtype", "uint16"),
         )
 
+    def get_rgbd_frame(self, camera_name: str = "head_rgbd_camera"):
+        camera_cfg = self._cam_config[camera_name]
+        return self._subscriber_manager.subscribe_rgbd(
+            self._host,
+            camera_cfg['zmq_port'],
+            request_bgr=self._request_bgr,
+            depth_dtype=camera_cfg.get("depth_dtype", "uint16"),
+        )
+
     def get_head_frame(self):
         return self.get_camera_frame('head_camera')
 
     def get_head_depth_frame(self):
         return self.get_depth_frame('head_depth_camera')
+
+    def get_head_rgbd_frame(self):
+        return self.get_rgbd_frame('head_rgbd_camera')
 
     def get_torso_frame(self):
         return self.get_camera_frame('torso_camera')

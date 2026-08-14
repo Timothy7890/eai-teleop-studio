@@ -446,12 +446,21 @@ function renderTasks() {
   $('#taskRows').innerHTML = pageTasks.map(task => `<tr>
     ${(() => {
       const archiveText = task.archive_status?.running ? '归档中...' : (task.archive_status?.last_archive || task.archive_status?.failed_at) ? '重新归档' : '归档数据集';
-      const archiveDisabled = task.active || task.archive_status?.running || appState.archive_jobs?.some(job => job.running);
+      const runningArchiveJob = appState.archive_jobs?.find(job => job.running);
+      const archiveBlockedByOther = Boolean(runningArchiveJob && runningArchiveJob.task_id !== task.id);
+      const archiveDisabled = task.active || task.archive_status?.running;
+      const archiveTitle = task.active
+        ? '采集任务运行中，请先安全停止'
+        : task.archive_status?.running
+          ? '该任务正在归档'
+          : archiveBlockedByOther
+            ? `已有归档任务正在运行：${runningArchiveJob.task_name || '未知任务'}，请等待完成后再归档`
+            : '';
       return `
     <td>${task.id}</td><td><strong>${escapeHtml(task.name)}</strong><span class="subline" title="${escapeHtml(task.description)}">${escapeHtml(task.description)}</span></td>
     <td>${escapeHtml(task.device_name)}</td><td><div class="progress-wrap"><div class="progress"><i style="width:${task.progress_percent}%"></i></div><span>${task.existing_episodes}/${task.target_episodes}</span></div></td>
     <td><span class="status ${statusClass(task.status)}">${task.status}</span></td><td>robot</td><td>${renderConvertStatus(task)}</td><td>${renderNormalizeStatus(task)}</td><td>${formatTime(task.created_at)}</td>
-    <td><div class="actions"><button class="action" data-action="view-task" data-id="${task.id}">查看</button><button class="action" data-action="preview-data" data-id="${task.id}">数据预览</button><button class="action blue" data-action="start-task" data-id="${task.id}">${task.active ? '进入采集' : '开始采集'}</button><button class="action" data-action="archive-task" data-id="${task.id}" ${archiveDisabled ? 'disabled' : ''}>${archiveText}</button></div></td>`})()}</tr>`).join('');
+    <td><div class="actions"><button class="action" data-action="view-task" data-id="${task.id}">查看</button><button class="action" data-action="preview-data" data-id="${task.id}">数据预览</button><button class="action blue" data-action="start-task" data-id="${task.id}">${task.active ? '进入采集' : '开始采集'}</button><button class="action" data-action="archive-task" data-id="${task.id}" data-archive-blocked="${archiveBlockedByOther ? 'true' : 'false'}" title="${escapeHtml(archiveTitle)}" ${archiveDisabled ? 'disabled' : ''}>${archiveText}</button></div></td>`})()}</tr>`).join('');
   $('#taskEmpty').classList.toggle('visible', !tasks.length);
   const pagination = $('#taskPagination');
   if (pagination) {
@@ -2713,6 +2722,12 @@ document.addEventListener('click', async event => {
     }
   }
   if(action==='archive-task'){
+    if (button.dataset.archiveBlocked === 'true') {
+      const runningArchiveJob = appState.archive_jobs?.find(job => job.running);
+      const taskName = runningArchiveJob?.task_name || '其他任务';
+      showNotice(`已有归档任务正在运行：${taskName}，请等待完成后再归档`);
+      return;
+    }
     const originalText=button.textContent;
     button.disabled=true;
     button.textContent='归档中...';

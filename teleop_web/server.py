@@ -3490,7 +3490,7 @@ class TeleopManager:
         return max(jobs, key=lambda item: item.get("started_at") or "", default=None)
 
     def archive_task(self, task_id: Any) -> dict[str, Any]:
-        """Create a dated ZIP archive for one stopped dataset task."""
+        """Create a dated tar.gz archive for one stopped dataset task."""
         with self._lock:
             if self.process is not None and self.process.poll() is None:
                 raise ValidationError("请先安全停止当前遥操任务，再归档数据集")
@@ -3515,13 +3515,13 @@ class TeleopManager:
             archive_dir.mkdir(parents=True, exist_ok=True)
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             archive_stem = f"{record['name']}_{timestamp}"
-            archive_path = archive_dir / f"{archive_stem}.zip"
+            archive_path = archive_dir / f"{archive_stem}.tar.gz"
             duplicate = 2
             while archive_path.exists():
-                archive_path = archive_dir / f"{archive_stem}_{duplicate}.zip"
+                archive_path = archive_dir / f"{archive_stem}_{duplicate}.tar.gz"
                 duplicate += 1
             temporary_base = archive_dir / f".{archive_stem}.{uuid.uuid4().hex}.tmp"
-            temporary_archive = Path(f"{temporary_base}.zip")
+            temporary_archive = Path(f"{temporary_base}.tar.gz")
             started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
             job_id = uuid.uuid4().hex[:10]
             job = {
@@ -3580,18 +3580,18 @@ class TeleopManager:
             archive_dir.mkdir(parents=True, exist_ok=True)
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             archive_stem = f"{record['name']}_{timestamp}"
-            archive_path = archive_dir / f"{archive_stem}.zip"
+            archive_path = archive_dir / f"{archive_stem}.tar.gz"
             duplicate = 2
             while archive_path.exists():
-                archive_path = archive_dir / f"{archive_stem}_{duplicate}.zip"
+                archive_path = archive_dir / f"{archive_stem}_{duplicate}.tar.gz"
                 duplicate += 1
 
             temporary_base = archive_dir / f".{archive_stem}.{uuid.uuid4().hex}.tmp"
-            temporary_archive = Path(f"{temporary_base}.zip")
+            temporary_archive = Path(f"{temporary_base}.tar.gz")
             try:
                 created = Path(shutil.make_archive(
                     str(temporary_base),
-                    "zip",
+                    "gztar",
                     root_dir=self.dataset_root,
                     base_dir=record["name"],
                 ))
@@ -3634,7 +3634,7 @@ class TeleopManager:
         try:
             created = Path(shutil.make_archive(
                 str(temporary_base),
-                "zip",
+                "gztar",
                 root_dir=self.dataset_root,
                 base_dir=task_name,
             ))
@@ -4590,7 +4590,7 @@ class TeleopManager:
             if not isinstance(cfg, dict):
                 continue
             record_colors = []
-            if cfg.get("enable_zmq"):
+            if cfg.get("enable_zmq") and cfg.get("data_format", "jpeg") == "jpeg":
                 if name == "head_camera" and cfg.get("binocular", False):
                     record_colors = [f"color_{color_idx}", f"color_{color_idx + 1}"]
                     color_idx += 2
