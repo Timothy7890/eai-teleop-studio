@@ -64,6 +64,7 @@ class IPC_Server:
         "CMD_START": "r",          # launch
         "CMD_STOP": "q",           # exit
         "CMD_RECORD_TOGGLE": "s",  # start & stop (toggle record)
+        "CMD_HAND_EYE_TOGGLE": "c", # hold/capture or rebase/resume
     }
 
     def __init__(self, on_press=None, get_state=None, on_arm_target=None, hb_fps=10.0):

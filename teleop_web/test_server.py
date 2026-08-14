@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from teleop_web.server import PROJECT_ROOT, TeleopManager, ValidationError, build_command, episode_progress, validate_device, validate_task
+from teleop_web.server import IpcBridge, PROJECT_ROOT, TeleopManager, ValidationError, build_command, episode_progress, validate_device, validate_task
 
 
 class ValidationTests(unittest.TestCase):
@@ -51,6 +51,31 @@ class ValidationTests(unittest.TestCase):
         task = validate_task({"name": "quad_view_test", "description": "四路相机视角"})
         command = build_command(device, task, Path("/tmp/datasets"))
         self.assertIn("--xr-view=quad", command)
+
+    def test_h2_hand_eye_mode_builds_expected_command(self):
+        device = validate_device({
+            "arm": "H2",
+            "input_mode": "controller",
+            "ee": "none",
+            "hand_eye_record": True,
+        })
+        task = validate_task({
+            "name": "hand_eye_capture",
+            "instruction": "Capture hand eye calibration samples",
+            "description": "手眼标定采集",
+        })
+        command = build_command(device, task, Path("/tmp/datasets"))
+        self.assertIn("--hand-eye-record", command)
+        self.assertEqual(IpcBridge.COMMANDS["hand_eye"], "CMD_HAND_EYE_TOGGLE")
+
+    def test_hand_eye_mode_rejects_non_h2_robot(self):
+        with self.assertRaises(ValidationError):
+            validate_device({
+                "arm": "G1_29",
+                "input_mode": "controller",
+                "ee": "none",
+                "hand_eye_record": True,
+            })
 
     def test_invalid_xr_view_is_rejected(self):
         with self.assertRaises(ValidationError):

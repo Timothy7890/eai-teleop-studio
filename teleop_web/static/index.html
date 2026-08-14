@@ -62,7 +62,7 @@
             <label><span>IK 回放推送频率 Hz</span><input name="ik_replay_live_fps" type="number" min="0.1" max="60" step="0.1" value="10"></label>
           </div>
           <div class="config-footer">
-            <div class="switches"><label><input name="headless" type="checkbox"> 无界面模式</label><label><input name="motion" type="checkbox" checked> 启用运动控制</label><label><input name="ik_replay_live_enable" type="checkbox"> IK 跟随推送</label></div>
+            <div class="switches"><label><input name="headless" type="checkbox"> 无界面模式</label><label><input name="motion" type="checkbox" checked> 启用运动控制</label><label><input name="hand_eye_record" type="checkbox"> 手眼标定采集模式</label><label><input name="ik_replay_live_enable" type="checkbox"> IK 跟随推送</label></div>
             <button class="primary" type="submit">保存设备配置</button>
           </div>
         </form>
@@ -209,6 +209,7 @@
       <div class="control-actions">
         <button id="startControl" class="success" disabled>开始遥操</button>
         <button id="recordControl" class="warning" disabled>开始录制</button>
+        <button id="handEyeControl" class="warning" disabled hidden>锁定并采样</button>
         <button id="stopControl" class="danger" disabled>结束遥操</button>
       </div>
       <div class="camera-panel">

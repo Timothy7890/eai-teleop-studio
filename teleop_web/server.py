@@ -342,6 +342,7 @@ DEFAULT_DEVICE = {
     "init_arm_pose_duration": 5,
     "headless": False,
     "motion": True,
+    "hand_eye_record": False,
     "ik_replay_live_enable": False,
     "ik_replay_live_url": DEFAULT_IK_REPLAY_LIVE_URL,
     "ik_replay_live_fps": 10,
@@ -495,6 +496,9 @@ def validate_device(raw: Any) -> dict[str, Any]:
     device["init_arm_pose_duration"] = init_pose_duration
     device["headless"] = bool(device.get("headless", False))
     device["motion"] = bool(device.get("motion", False))
+    device["hand_eye_record"] = bool(device.get("hand_eye_record", False))
+    if device["hand_eye_record"] and device["arm"] != "H2":
+        raise ValidationError("手眼标定采集模式目前仅支持 H2")
     device["ik_replay_live_enable"] = bool(device.get("ik_replay_live_enable", False))
     ik_replay_live_url = str(device.get("ik_replay_live_url", "") or "").strip()
     if device["ik_replay_live_enable"]:
@@ -616,6 +620,8 @@ def build_command(device: dict[str, Any], task: dict[str, str], dataset_root: Pa
         command.append("--headless")
     if device["motion"]:
         command.append("--motion")
+    if device.get("hand_eye_record"):
+        command.append("--hand-eye-record")
     if device.get("ik_replay_live_enable") and device.get("ik_replay_live_url"):
         command.append("--ik-replay-live-enable")
         command.append(f"--ik-replay-live-url={device['ik_replay_live_url']}")
@@ -1174,6 +1180,7 @@ class IpcBridge:
     COMMANDS = {
         "start": "CMD_START",
         "record": "CMD_RECORD_TOGGLE",
+        "hand_eye": "CMD_HAND_EYE_TOGGLE",
         "stop": "CMD_STOP",
     }
 

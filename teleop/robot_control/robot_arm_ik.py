@@ -1418,6 +1418,30 @@ class H2_ArmIK:
         robot_right_pose[:3, 3] *= scale_factor
         return robot_left_pose, robot_right_pose
 
+    def forward_wrist_poses(self, dual_arm_q):
+        """Return the H2 IK left/right end-effector frames for a 14-DoF arm state."""
+        q = np.asarray(dual_arm_q, dtype=float)
+        if q.shape != (self.reduced_robot.model.nq,) or not np.all(np.isfinite(q)):
+            raise ValueError(
+                f"H2 arm FK expects {self.reduced_robot.model.nq} finite joint values, got {q.shape}"
+            )
+        pin.forwardKinematics(self.reduced_robot.model, self.reduced_robot.data, q)
+        pin.updateFramePlacements(self.reduced_robot.model, self.reduced_robot.data)
+        left_pose = np.asarray(self.reduced_robot.data.oMf[self.L_hand_id].homogeneous).copy()
+        right_pose = np.asarray(self.reduced_robot.data.oMf[self.R_hand_id].homogeneous).copy()
+        return left_pose, right_pose
+
+    def reset_solution(self, dual_arm_q):
+        """Reset IK warm-start and smoothing state to a measured hold pose."""
+        q = np.asarray(dual_arm_q, dtype=float)
+        if q.shape != (self.reduced_robot.model.nq,) or not np.all(np.isfinite(q)):
+            raise ValueError(
+                f"H2 IK reset expects {self.reduced_robot.model.nq} finite joint values, got {q.shape}"
+            )
+        self.init_data = q.copy()
+        self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), q.size)
+        self.smooth_filter.add_data(q.copy())
+
     def solve_ik(
         self,
         left_wrist,

@@ -42,6 +42,15 @@ from teleop.robot_control.end_effectors import (
 )
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
+from teleop.utils.hand_eye_capture import (
+    CAPTURING as HAND_EYE_CAPTURING,
+    FOLLOW as HAND_EYE_FOLLOW,
+    HOLD as HAND_EYE_HOLD,
+    SAVING as HAND_EYE_SAVING,
+    SETTLING as HAND_EYE_SETTLING,
+    HandEyeCaptureState,
+)
+from teleop.utils.hand_eye_recorder import HandEyeRecorder
 from teleop.utils.ik_replay_live import IKReplayLivePusher, build_ik_replay_live_payload
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
@@ -71,6 +80,7 @@ RECORD_TOGGLE  = False  # Toggle recording state
 EXTERNAL_ARM_TARGET = None
 EXTERNAL_ARM_TARGET_LOCK = threading.Lock()
 EXTERNAL_ARM_TARGET_TIMEOUT = 0.5
+HAND_EYE_CAPTURE = None
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -92,6 +102,8 @@ def on_press(key):
         STOP = True
     elif key == 's' and START == True:
         RECORD_TOGGLE = True
+    elif key == 'c' and START == True and HAND_EYE_CAPTURE is not None:
+        HAND_EYE_CAPTURE.request_toggle()
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -101,7 +113,7 @@ def get_state() -> dict:
     with EXTERNAL_ARM_TARGET_LOCK:
         external_target = dict(EXTERNAL_ARM_TARGET or {})
     external_age = time.time() - external_target.get("received_at", 0.0) if external_target else None
-    return {
+    state = {
         "START": START,
         "STOP": STOP,
         "READY": READY,
@@ -109,6 +121,11 @@ def get_state() -> dict:
         "EXTERNAL_ARM_TARGET_ACTIVE": external_age is not None and external_age <= EXTERNAL_ARM_TARGET_TIMEOUT,
         "EXTERNAL_ARM_TARGET_SOURCE": external_target.get("source"),
     }
+    if HAND_EYE_CAPTURE is not None:
+        state.update({"HAND_EYE_ENABLED": True, **HAND_EYE_CAPTURE.snapshot()})
+    else:
+        state["HAND_EYE_ENABLED"] = False
+    return state
 
 
 def set_external_arm_target(msg: dict):
@@ -412,6 +429,16 @@ if __name__ == '__main__':
     parser.add_argument('--no-camera', action='store_true',help='Disable all camera input and use XR pass-through display mode')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
+    parser.add_argument('--hand-eye-record', action='store_true',
+                        help='Enable sparse hand-eye RGB-D capture with hold and XR rebase.')
+    parser.add_argument('--hand-eye-settle-seconds', type=float, default=0.5,
+                        help='Required stable time before a hand-eye burst is captured.')
+    parser.add_argument('--hand-eye-max-joint-speed', type=float, default=0.02,
+                        help='Maximum absolute arm joint speed in rad/s while settling.')
+    parser.add_argument('--hand-eye-max-joint-span', type=float, default=0.003,
+                        help='Maximum arm joint position span in rad over the settling window.')
+    parser.add_argument('--hand-eye-burst-frames', type=int, default=5,
+                        help='Number of unique RGB-D frames saved per hand-eye sample.')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
     parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
@@ -419,6 +446,17 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    if args.hand_eye_record and args.arm != "H2":
+        raise ValueError("--hand-eye-record currently supports only --arm=H2.")
+    if args.hand_eye_record and not args.record:
+        logger_mp.info("--hand-eye-record enables recording without the continuous EpisodeWriter.")
+    if args.hand_eye_record:
+        HAND_EYE_CAPTURE = HandEyeCaptureState(
+            settle_seconds=args.hand_eye_settle_seconds,
+            max_joint_speed=args.hand_eye_max_joint_speed,
+            max_joint_span=args.hand_eye_max_joint_span,
+            burst_frames=args.hand_eye_burst_frames,
+        )
     if args.arm_reference_mode is None:
         args.arm_reference_mode = 'head_position' if args.arm == 'H2' else 'head_yaw'
     PASSIVE_EE = set(PASSIVE_END_EFFECTORS)
@@ -466,6 +504,8 @@ if __name__ == '__main__':
     init_arm_q = None
     init_locked_joint_targets = {}
     ik_replay_pusher = None
+    recorder = None
+    hand_eye_recorder = None
 
     try:
         # setup dds communication domains id
@@ -515,6 +555,23 @@ if __name__ == '__main__':
             img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
             camera_config = img_client.get_cam_config()
             logger_mp.debug(f"Camera config: {camera_config}")
+        hand_eye_camera_config = camera_config.get("head_rgbd_camera", {})
+        if args.hand_eye_record:
+            if args.no_camera:
+                raise ValueError("--hand-eye-record requires camera input.")
+            if (
+                not isinstance(hand_eye_camera_config, dict)
+                or not hand_eye_camera_config.get("enable_zmq")
+                or hand_eye_camera_config.get("data_format") != "rgbd"
+            ):
+                raise RuntimeError(
+                    "head_rgbd_camera must be an enabled ZMQ RGB-D stream for hand-eye recording."
+                )
+            # Lazily creates the RGB-D subscriber before the first capture request.
+            img_client.get_rgbd_frame("head_rgbd_camera")
+            hand_eye_recorder = HandEyeRecorder(
+                os.path.join(args.task_dir, args.task_name)
+            )
         record_camera_names = [
             camera_name
             for camera_name, camera_cfg in camera_config.items()
@@ -720,7 +777,7 @@ if __name__ == '__main__':
             sim_state_subscriber = start_sim_state_subscribe()
 
         # record + headless / non-headless mode
-        if args.record:
+        if args.record and not args.hand_eye_record:
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
@@ -742,7 +799,9 @@ if __name__ == '__main__':
 
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
-        if args.record:
+        if args.hand_eye_record:
+            logger_mp.info("🟠  Press controller [B] or use the Web button to hold/capture, then press again to rebase.")
+        elif args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
@@ -768,6 +827,7 @@ if __name__ == '__main__':
         arm_ctrl.speed_gradual_max()
 
         image_frames = {camera_name: None for camera_name in record_camera_names}
+        continuous_record = args.record and not args.hand_eye_record
         waiting_motion_log_count = 0
         arm_trace_last_log = 0.0
         arm_trace_start_q = None
@@ -780,7 +840,7 @@ if __name__ == '__main__':
             if img_client is not None:
                 for camera_name in runtime_camera_names:
                     camera_cfg = camera_config.get(camera_name, {})
-                    if camera_cfg.get('enable_zmq') and (args.record or xr_need_local_img):
+                    if camera_cfg.get('enable_zmq') and (continuous_record or xr_need_local_img):
                         image_frames[camera_name] = img_client.get_camera_frame(camera_name)
                 if xr_need_local_img:
                     if xr_quad_view:
@@ -791,7 +851,7 @@ if __name__ == '__main__':
                             tv_wrapper.render_to_xr(head_img.bgr)
 
             # record mode
-            if args.record and RECORD_TOGGLE:
+            if continuous_record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
                 if not RECORD_RUNNING:
                     if recorder.create_episode():
@@ -835,7 +895,7 @@ if __name__ == '__main__':
                 pass
             with xr_motion_data_ready.get_lock():
                 xr_motion_data_ready.value = tele_data.motion_data_ready
-            if args.record:
+            if continuous_record:
                 # Keep recorder readiness fresh even when XR motion is not valid.
                 # The motion gate below may skip arm control, but the web console
                 # still needs an accurate save/record-ready state.
@@ -848,8 +908,136 @@ if __name__ == '__main__':
             if arm_trace_start_q is None:
                 arm_trace_start_q = current_lr_arm_q.copy()
 
-            control_input_ready = tele_data.motion_data_ready or external_arm_target is not None
-            if not tele_data.motion_data_ready and external_arm_target is None:
+            hand_eye_holding = False
+            if args.hand_eye_record:
+                if args.input_mode == "controller":
+                    HAND_EYE_CAPTURE.observe_button(tele_data.right_ctrl_bButton)
+                if HAND_EYE_CAPTURE.consume_toggle():
+                    if HAND_EYE_CAPTURE.state == HAND_EYE_FOLLOW:
+                        HAND_EYE_CAPTURE.begin_hold(current_lr_arm_q)
+                        logger_mp.info("Hand-eye capture: arm targets latched; waiting for measured joints to settle.")
+                    elif HAND_EYE_CAPTURE.state == HAND_EYE_HOLD:
+                        if not tele_data.motion_data_ready:
+                            HAND_EYE_CAPTURE.fail("XR motion data is not ready; remaining in HOLD.")
+                        else:
+                            try:
+                                hold_q = HAND_EYE_CAPTURE.hold_q
+                                left_robot, right_robot = arm_ik.forward_wrist_poses(hold_q)
+                                anchors = HAND_EYE_CAPTURE.preview_rebase(
+                                    tele_data.left_wrist_pose,
+                                    tele_data.right_wrist_pose,
+                                    left_robot,
+                                    right_robot,
+                                )
+                                left_target, right_target = anchors.apply(
+                                    tele_data.left_wrist_pose,
+                                    tele_data.right_wrist_pose,
+                                )
+                                arm_ik.reset_solution(hold_q)
+                                resume_q, _ = arm_ik.solve_ik(
+                                    left_target,
+                                    right_target,
+                                    hold_q,
+                                    np.zeros_like(hold_q),
+                                )
+                                resume_delta = float(np.max(np.abs(resume_q - hold_q)))
+                                if resume_delta > 0.02:
+                                    arm_ik.reset_solution(hold_q)
+                                    HAND_EYE_CAPTURE.fail(
+                                        f"Rebase rejected: first IK delta {resume_delta:.5f} rad exceeds 0.02 rad."
+                                    )
+                                else:
+                                    HAND_EYE_CAPTURE.commit_rebase(anchors)
+                                    logger_mp.info(
+                                        f"Hand-eye capture: XR rebase committed; first IK delta={resume_delta:.5f} rad."
+                                    )
+                            except Exception as exc:
+                                HAND_EYE_CAPTURE.fail(f"Rebase failed: {exc}")
+                                logger_mp.error(f"Hand-eye rebase failed: {exc}")
+                    else:
+                        logger_mp.warning(
+                            f"Hand-eye toggle ignored while state={HAND_EYE_CAPTURE.state}."
+                        )
+
+                if HAND_EYE_CAPTURE.state == HAND_EYE_SETTLING:
+                    if HAND_EYE_CAPTURE.update_settling(current_lr_arm_q, current_lr_arm_dq):
+                        hand_eye_recorder.begin_sample()
+                        logger_mp.info("Hand-eye capture: joints settled; collecting RGB-D burst.")
+
+                if HAND_EYE_CAPTURE.state == HAND_EYE_CAPTURING:
+                    try:
+                        rgbd = img_client.get_rgbd_frame("head_rgbd_camera")
+                        if (
+                            rgbd
+                            and rgbd.depth is not None
+                            and rgbd.rgb_jpg is not None
+                            and rgbd.metadata is not None
+                        ):
+                            joint_timestamp_ns = time.time_ns()
+                            captured_frames = hand_eye_recorder.add_frame(
+                                rgb_jpg=rgbd.rgb_jpg,
+                                depth=rgbd.depth,
+                                rgbd_metadata=rgbd.metadata,
+                                right_arm_q=current_lr_arm_q[-7:],
+                                joint_timestamp_ns=joint_timestamp_ns,
+                                sample_timestamp_ns=time.time_ns(),
+                            )
+                            HAND_EYE_CAPTURE.set_capture_progress(captured_frames)
+                            if captured_frames >= HAND_EYE_CAPTURE.burst_frames:
+                                color_topic = hand_eye_camera_config.get("color_camera", "head_camera")
+                                color_cfg = camera_config.get(color_topic, {})
+                                hand_eye_recorder.submit_sample(
+                                    {
+                                        "robot": args.arm,
+                                        "camera_stream": "head_rgbd_camera",
+                                        "camera_serial": color_cfg.get("serial_number"),
+                                        "right_arm_joint_order": [
+                                            "right_shoulder_pitch",
+                                            "right_shoulder_roll",
+                                            "right_shoulder_yaw",
+                                            "right_elbow",
+                                            "right_wrist_roll",
+                                            "right_wrist_pitch",
+                                            "right_wrist_yaw",
+                                        ],
+                                    }
+                                )
+                                HAND_EYE_CAPTURE.begin_saving()
+                                logger_mp.info("Hand-eye capture: burst complete; saving asynchronously.")
+                    except Exception as exc:
+                        HAND_EYE_CAPTURE.fail(f"Capture failed: {exc}")
+                        logger_mp.error(f"Hand-eye capture failed: {exc}")
+
+                if HAND_EYE_CAPTURE.state == HAND_EYE_SAVING:
+                    save_result = hand_eye_recorder.poll_result()
+                    if save_result is not None:
+                        if save_result.get("ok"):
+                            HAND_EYE_CAPTURE.finish_saving(save_result["path"])
+                            logger_mp.info(
+                                f"Hand-eye sample saved: {save_result['path']} "
+                                f"({save_result['frame_count']} frames)."
+                            )
+                        else:
+                            HAND_EYE_CAPTURE.fail(save_result.get("error", "unknown save error"))
+                            logger_mp.error(f"Hand-eye sample save failed: {save_result}")
+
+                hand_eye_holding = HAND_EYE_CAPTURE.is_holding
+                RECORD_RUNNING = HAND_EYE_CAPTURE.state in {
+                    HAND_EYE_CAPTURING,
+                    HAND_EYE_SAVING,
+                }
+                READY = HAND_EYE_CAPTURE.state in {HAND_EYE_FOLLOW, HAND_EYE_HOLD}
+
+            control_input_ready = (
+                tele_data.motion_data_ready
+                or external_arm_target is not None
+                or hand_eye_holding
+            )
+            if (
+                not tele_data.motion_data_ready
+                and external_arm_target is None
+                and not hand_eye_holding
+            ):
                 waiting_motion_log_count += 1
                 if waiting_motion_log_count % max(1, int(args.frequency)) == 0:
                     logger_mp.warning(
@@ -878,25 +1066,41 @@ if __name__ == '__main__':
                             logger_mp.warning(f"Loco {loco_wrapper.robot} Damp returned code={damp_code}")
                             loco_last_warning_time = now
                 # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
-                move_code = loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
-                                              -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
-                                              -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
-                if move_code not in (None, 0):
-                    now = time.time()
-                    if now - loco_last_warning_time >= 1.0:
-                        logger_mp.warning(f"Loco {loco_wrapper.robot} Move returned code={move_code}")
-                        loco_last_warning_time = now
+                if not args.hand_eye_record:
+                    move_code = loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
+                                                  -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
+                                                  -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
+                    if move_code not in (None, 0):
+                        now = time.time()
+                        if now - loco_last_warning_time >= 1.0:
+                            logger_mp.warning(f"Loco {loco_wrapper.robot} Move returned code={move_code}")
+                            loco_last_warning_time = now
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
-            if not control_input_ready:
+            if hand_eye_holding:
+                sol_q = HAND_EYE_CAPTURE.hold_q
+                sol_tauff = np.zeros_like(sol_q)
+            elif not control_input_ready:
                 sol_q = current_lr_arm_q.copy()
                 sol_tauff = np.zeros_like(sol_q)
             elif external_arm_target is not None:
                 sol_q = external_arm_target
                 sol_tauff = np.zeros_like(sol_q)
             else:
-                sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
+                left_wrist_target = tele_data.left_wrist_pose
+                right_wrist_target = tele_data.right_wrist_pose
+                if args.hand_eye_record:
+                    left_wrist_target, right_wrist_target = HAND_EYE_CAPTURE.apply_rebase(
+                        left_wrist_target,
+                        right_wrist_target,
+                    )
+                sol_q, sol_tauff = arm_ik.solve_ik(
+                    left_wrist_target,
+                    right_wrist_target,
+                    current_lr_arm_q,
+                    current_lr_arm_dq,
+                )
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             if control_input_ready:
@@ -927,7 +1131,7 @@ if __name__ == '__main__':
                 arm_trace_last_log = time.time()
 
             # record data
-            if args.record:
+            if continuous_record:
                 READY = recorder.is_ready() # now ready to (2) enter RECORD_RUNNING state
                 # dex hand or gripper
                 if args.ee == "dex3" and args.input_mode == "hand":
@@ -1141,9 +1345,14 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to stop sim state subscriber: {e}")
         
         try:
-            if args.record:
+            if recorder is not None:
                 recorder.close()
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
+        try:
+            if hand_eye_recorder is not None:
+                hand_eye_recorder.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close hand-eye recorder: {e}")
         logger_mp.info("✅ Finally, exiting program.")
         exit(0)
