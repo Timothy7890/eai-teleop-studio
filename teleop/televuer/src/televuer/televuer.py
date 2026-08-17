@@ -9,7 +9,7 @@ import os
 import time
 from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Tuple
 
 
 class TeleVuer:
@@ -110,6 +110,14 @@ class TeleVuer:
         self._hud_level_shared = Value('i', 0, lock=True)
         self._hud_version_shared = Value('L', 0, lock=True)
         self._hud_last_payload = None
+        self._depth_preview_shape = (320, 512, 3)
+        self._depth_preview_shared = Array(
+            'B',
+            int(np.prod(self._depth_preview_shape)),
+            lock=True,
+        )
+        self._depth_preview_visible_shared = Value('b', False, lock=True)
+        self._depth_preview_version_shared = Value('L', 0, lock=True)
 
         if self.display_mode == "immersive":
             if self.webrtc:
@@ -193,6 +201,7 @@ class TeleVuer:
         await asyncio.gather(
             self._scene_fn(session),
             self._main_hud(session),
+            self._main_depth_preview(session),
         )
 
     def set_hud_status(self, title: str, detail: str = "", level: str = "info") -> None:
@@ -274,6 +283,119 @@ class TeleVuer:
                             aspect=1024 / 220,
                             distanceToCamera=1.4,
                             format="png",
+                        ),
+                        to="bgChildren",
+                    )
+                rendered_version = version
+            await asyncio.sleep(0.1)
+
+    def set_depth_preview(self, depth: np.ndarray) -> dict:
+        """Colorize one depth frame and show it as a static VR overlay."""
+        depth_array = np.asarray(depth)
+        if depth_array.ndim != 2:
+            raise ValueError(f"depth preview requires a 2D array, got {depth_array.shape}")
+        valid_mask = depth_array > 0
+        valid = depth_array[valid_mask]
+        normalized = np.zeros(depth_array.shape, dtype=np.uint8)
+        if valid.size:
+            low, high = np.percentile(valid, [2.0, 98.0])
+            if high <= low:
+                low = float(valid.min())
+                high = float(valid.max())
+            if high > low:
+                normalized[valid_mask] = np.clip(
+                    (depth_array[valid_mask].astype(np.float32) - low)
+                    * (255.0 / (high - low)),
+                    0,
+                    255,
+                ).astype(np.uint8)
+            else:
+                normalized[valid_mask] = 255
+            preview_bgr = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+            preview_bgr[~valid_mask] = 0
+            depth_min = int(valid.min())
+            depth_max = int(valid.max())
+        else:
+            preview_bgr = np.zeros((*depth_array.shape, 3), dtype=np.uint8)
+            cv2.putText(
+                preview_bgr,
+                "NO VALID DEPTH",
+                (max(10, depth_array.shape[1] // 5), depth_array.shape[0] // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.2,
+                (0, 0, 255),
+                3,
+                cv2.LINE_AA,
+            )
+            depth_min = 0
+            depth_max = 0
+        preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
+        preview_rgb = cv2.resize(
+            preview_rgb,
+            (self._depth_preview_shape[1], self._depth_preview_shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        flat_preview = np.ascontiguousarray(preview_rgb).reshape(-1)
+        with self._depth_preview_shared.get_lock():
+            self._depth_preview_shared[:] = flat_preview
+        with self._depth_preview_visible_shared.get_lock():
+            self._depth_preview_visible_shared.value = True
+        with self._depth_preview_version_shared.get_lock():
+            self._depth_preview_version_shared.value += 1
+        return {
+            "min": depth_min,
+            "max": depth_max,
+            "valid_ratio": float(valid.size / depth_array.size),
+        }
+
+    def clear_depth_preview(self) -> None:
+        with self._depth_preview_visible_shared.get_lock():
+            self._depth_preview_visible_shared.value = False
+        with self._depth_preview_version_shared.get_lock():
+            self._depth_preview_version_shared.value += 1
+
+    def _read_depth_preview(self) -> Tuple[bool, np.ndarray]:
+        with self._depth_preview_visible_shared.get_lock():
+            visible = bool(self._depth_preview_visible_shared.value)
+        with self._depth_preview_shared.get_lock():
+            preview = np.frombuffer(
+                bytes(self._depth_preview_shared[:]),
+                dtype=np.uint8,
+            ).reshape(self._depth_preview_shape)
+        return visible, preview
+
+    async def _main_depth_preview(self, session):
+        rendered_version = -1
+        while True:
+            with self._depth_preview_version_shared.get_lock():
+                version = int(self._depth_preview_version_shared.value)
+            if version != rendered_version:
+                visible, preview = self._read_depth_preview()
+                if visible:
+                    session.upsert(
+                        ImageBackground(
+                            preview,
+                            key="hand-eye-depth-preview",
+                            position=[0.62, 0.08, -1.35],
+                            height=0.58,
+                            aspect=self._depth_preview_shape[1] / self._depth_preview_shape[0],
+                            distanceToCamera=1.35,
+                            format="jpeg",
+                            hide=False,
+                        ),
+                        to="bgChildren",
+                    )
+                else:
+                    session.upsert(
+                        ImageBackground(
+                            np.zeros((1, 1, 3), dtype=np.uint8),
+                            key="hand-eye-depth-preview",
+                            position=[0, -10, -1],
+                            height=0.001,
+                            aspect=1,
+                            distanceToCamera=1,
+                            format="jpeg",
+                            hide=True,
                         ),
                         to="bgChildren",
                     )

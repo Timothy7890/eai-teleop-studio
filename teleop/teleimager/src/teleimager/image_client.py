@@ -716,7 +716,14 @@ class ZMQ_SubscriberManager:
         depth_shape: Optional[Tuple[int, int]] = None,
         depth_dtype: str = "uint16",
     ) -> ZMQ_SubscriberThread:
-        key = (host, port, request_bgr, data_format, tuple(depth_shape) if depth_shape is not None else None, depth_dtype)
+        key = self._subscriber_key(
+            host,
+            port,
+            request_bgr=request_bgr,
+            data_format=data_format,
+            depth_shape=depth_shape,
+            depth_dtype=depth_dtype,
+        )
         with self._lock:
             if key not in self._subscriber_threads:
                 self._subscriber_threads[key] = self._create_subscriber_thread(
@@ -728,6 +735,25 @@ class ZMQ_SubscriberManager:
                     depth_dtype=depth_dtype,
                 )
             return self._subscriber_threads[key]
+
+    @staticmethod
+    def _subscriber_key(
+        host: str,
+        port: int,
+        *,
+        request_bgr: bool = False,
+        data_format: str = "jpeg",
+        depth_shape: Optional[Tuple[int, int]] = None,
+        depth_dtype: str = "uint16",
+    ) -> Tuple[Any, ...]:
+        return (
+            host,
+            port,
+            request_bgr,
+            data_format,
+            tuple(depth_shape) if depth_shape is not None else None,
+            depth_dtype,
+        )
         
     # --------------------------------------------------------
     # public api
@@ -783,6 +809,28 @@ class ZMQ_SubscriberManager:
             depth_dtype=depth_dtype,
         )
         return subscriber_thread.recv()
+
+    def unsubscribe_rgbd(
+        self,
+        host: str,
+        port: int,
+        request_bgr: bool = False,
+        depth_dtype: str = "uint16",
+    ) -> bool:
+        """Stop one RGB-D subscriber without affecting other streams."""
+        key = self._subscriber_key(
+            host,
+            port,
+            request_bgr=request_bgr,
+            data_format="rgbd",
+            depth_dtype=depth_dtype,
+        )
+        with self._lock:
+            subscriber = self._subscriber_threads.pop(key, None)
+        if subscriber is None:
+            return False
+        subscriber.stop()
+        return True
 
     def close(self) -> None:
         """Close all subscribers."""
@@ -933,12 +981,19 @@ class ZMQ_Requester:
 # image client
 # ========================================================
 class ImageClient:
-    def __init__(self, host="192.168.123.164", request_port=60000, request_bgr: bool = False):
+    def __init__(
+        self,
+        host="192.168.123.164",
+        request_port=60000,
+        request_bgr: bool = False,
+        auto_subscribe: bool = True,
+    ):
         """
         Args:
             server_address:   IP address of image host server
             request_port:     TCP port for camera configuration request
             request_bgr:      Whether to request BGR decoding for subscribers
+            auto_subscribe:   Whether to eagerly subscribe to every enabled JPEG stream
         """
         self._host = host
         self._request_port = request_port
@@ -952,11 +1007,12 @@ class ImageClient:
         if self._cam_config is None:
             raise RuntimeError("Failed to get camera configuration.")
 
-        for camera_name, camera_cfg in self._cam_config.items():
-            if not isinstance(camera_cfg, dict) or not camera_cfg.get('enable_zmq'):
-                continue
-            if camera_cfg.get("data_format", "jpeg") == "jpeg":
-                self._subscriber_manager.subscribe(self._host, camera_cfg['zmq_port'], request_bgr=self._request_bgr)
+        if auto_subscribe:
+            for camera_name, camera_cfg in self._cam_config.items():
+                if not isinstance(camera_cfg, dict) or not camera_cfg.get('enable_zmq'):
+                    continue
+                if camera_cfg.get("data_format", "jpeg") == "jpeg":
+                    self._subscriber_manager.subscribe(self._host, camera_cfg['zmq_port'], request_bgr=self._request_bgr)
 
         if not self._cam_config['head_camera']['enable_zmq'] and not self._cam_config['head_camera']['enable_webrtc']:
             logger_mp.warning("[Image Client] NOTICE! Head camera is not enabled on both ZMQ and WebRTC.")
@@ -989,12 +1045,33 @@ class ImageClient:
             camera_cfg.get("depth_dtype", "uint16"),
         )
 
-    def get_rgbd_frame(self, camera_name: str = "head_rgbd_camera"):
+    def get_rgbd_frame(
+        self,
+        camera_name: str = "head_rgbd_camera",
+        *,
+        request_bgr: Optional[bool] = None,
+    ):
         camera_cfg = self._cam_config[camera_name]
+        decode_bgr = self._request_bgr if request_bgr is None else bool(request_bgr)
         return self._subscriber_manager.subscribe_rgbd(
             self._host,
             camera_cfg['zmq_port'],
-            request_bgr=self._request_bgr,
+            request_bgr=decode_bgr,
+            depth_dtype=camera_cfg.get("depth_dtype", "uint16"),
+        )
+
+    def unsubscribe_rgbd(
+        self,
+        camera_name: str = "head_rgbd_camera",
+        *,
+        request_bgr: Optional[bool] = None,
+    ) -> bool:
+        camera_cfg = self._cam_config[camera_name]
+        decode_bgr = self._request_bgr if request_bgr is None else bool(request_bgr)
+        return self._subscriber_manager.unsubscribe_rgbd(
+            self._host,
+            camera_cfg['zmq_port'],
+            request_bgr=decode_bgr,
             depth_dtype=camera_cfg.get("depth_dtype", "uint16"),
         )
 

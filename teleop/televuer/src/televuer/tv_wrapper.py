@@ -459,6 +459,12 @@ class TeleVuerWrapper:
 
     def set_hud_status(self, title: str, detail: str = "", level: str = "info"):
         self.tvuer.set_hud_status(title, detail, level)
+
+    def set_depth_preview(self, depth: np.ndarray) -> dict:
+        return self.tvuer.set_depth_preview(depth)
+
+    def clear_depth_preview(self):
+        self.tvuer.clear_depth_preview()
     
     def close(self):
         self.tvuer.close()

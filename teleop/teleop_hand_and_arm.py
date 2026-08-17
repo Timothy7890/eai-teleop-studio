@@ -670,7 +670,11 @@ if __name__ == '__main__':
                 "Camera disabled: only robot states and actions will be recorded."
             )
         else:
-            img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
+            img_client = ImageClient(
+                host=args.img_server_ip,
+                request_bgr=True,
+                auto_subscribe=not args.hand_eye_record,
+            )
             camera_config = img_client.get_cam_config()
             logger_mp.debug(f"Camera config: {camera_config}")
         hand_eye_camera_config = camera_config.get("head_rgbd_camera", {})
@@ -685,8 +689,6 @@ if __name__ == '__main__':
                 raise RuntimeError(
                     "head_rgbd_camera must be an enabled ZMQ RGB-D stream for hand-eye recording."
                 )
-            # Lazily creates the RGB-D subscriber before the first capture request.
-            img_client.get_rgbd_frame("head_rgbd_camera")
             hand_eye_recorder = HandEyeRecorder(
                 os.path.join(args.task_dir, args.task_name)
             )
@@ -703,6 +705,11 @@ if __name__ == '__main__':
             and not args.no_camera
             and args.display_mode != 'pass-through'
         )
+        if args.hand_eye_record and xr_quad_view:
+            logger_mp.warning(
+                "Hand-eye recording uses the head camera only; falling back from XR quad view to head view."
+            )
+            xr_quad_view = False
         xr_camera_names = [
             camera_name
             for camera_name in XR_QUAD_CAMERA_ORDER
@@ -723,7 +730,11 @@ if __name__ == '__main__':
             else bool(xr_camera_names)
         )
         xr_need_local_img = not (args.display_mode == 'pass-through' or xr_use_webrtc)
-        runtime_camera_names = ordered_unique(record_camera_names + (xr_camera_names if xr_quad_view else ['head_camera']))
+        runtime_record_camera_names = [] if args.hand_eye_record else record_camera_names
+        runtime_camera_names = ordered_unique(
+            runtime_record_camera_names
+            + (xr_camera_names if xr_quad_view else ['head_camera'])
+        )
         logger_mp.info(
             f"XR view: {'quad' if xr_quad_view else 'head'}, "
             f"local_render={xr_need_local_img}, cameras={xr_camera_names if xr_quad_view else ['head_camera']}"
@@ -1120,11 +1131,25 @@ if __name__ == '__main__':
                     and HAND_EYE_REPLAY.state == HAND_EYE_REPLAY.EVENT_HOLD
                     and HAND_EYE_CAPTURE.state == HAND_EYE_FOLLOW
                 ):
-                    replay_hold_q = np.concatenate([left_fixed_q, current_lr_arm_q[-7:]])
-                    HAND_EYE_CAPTURE.begin_hold(replay_hold_q)
-                    logger_mp.info(
-                        f"Hand-eye replay reached capture event at frame {HAND_EYE_REPLAY.index}."
-                    )
+                    try:
+                        img_client.get_rgbd_frame(
+                            "head_rgbd_camera",
+                            request_bgr=False,
+                        )
+                        replay_hold_q = np.concatenate([left_fixed_q, current_lr_arm_q[-7:]])
+                        HAND_EYE_CAPTURE.begin_hold(replay_hold_q)
+                        logger_mp.info(
+                            f"Hand-eye replay reached capture event at frame {HAND_EYE_REPLAY.index}; "
+                            "RGB-D subscriber started."
+                        )
+                    except Exception as exc:
+                        img_client.unsubscribe_rgbd(
+                            "head_rgbd_camera",
+                            request_bgr=False,
+                        )
+                        HAND_EYE_CAPTURE.fail(f"RGB-D subscription failed: {exc}")
+                        HAND_EYE_REPLAY.abort(f"RGB-D subscription failed: {exc}")
+                        logger_mp.error(f"Hand-eye replay RGB-D subscription failed: {exc}")
 
                 if not replay_mode and args.input_mode == "controller":
                     b_button_fired = HAND_EYE_CAPTURE.observe_button(
@@ -1164,14 +1189,24 @@ if __name__ == '__main__':
                                 raise RuntimeError(
                                     "capture target IK returned non-finite joints"
                                 )
+                            tv_wrapper.clear_depth_preview()
+                            img_client.get_rgbd_frame(
+                                "head_rgbd_camera",
+                                request_bgr=False,
+                            )
                             HAND_EYE_CAPTURE.begin_hold(hold_q)
                             if trajectory_recorder is not None:
                                 trajectory_recorder.begin_capture_event()
                             logger_mp.info(
                                 "Hand-eye capture: current absolute XR target latched; "
-                                "moving to target and waiting for measured joints to settle."
+                                "moving to target and waiting for measured joints to settle; "
+                                "RGB-D subscriber started."
                             )
                         except Exception as exc:
+                            img_client.unsubscribe_rgbd(
+                                "head_rgbd_camera",
+                                request_bgr=False,
+                            )
                             logger_mp.error(
                                 f"Hand-eye capture target IK failed; continuing follow: {exc}"
                             )
@@ -1206,6 +1241,7 @@ if __name__ == '__main__':
                                     "duration": max(args.hand_eye_resume_seconds, 0.1),
                                 }
                                 HAND_EYE_CAPTURE.begin_resume()
+                                tv_wrapper.clear_depth_preview()
                                 logger_mp.info(
                                     "Hand-eye capture: smooth absolute resume started; "
                                     f"joint_delta={resume_delta:.5f} rad, "
@@ -1222,6 +1258,10 @@ if __name__ == '__main__':
                         )
 
                 if HAND_EYE_CAPTURE.check_hold_drift(current_lr_arm_q):
+                    img_client.unsubscribe_rgbd(
+                        "head_rgbd_camera",
+                        request_bgr=False,
+                    )
                     hold_error = HAND_EYE_CAPTURE.snapshot().get("HAND_EYE_ERROR")
                     if trajectory_recorder is not None:
                         trajectory_recorder.mark_capture_error(hold_error or "hold drift")
@@ -1236,7 +1276,10 @@ if __name__ == '__main__':
 
                 if HAND_EYE_CAPTURE.state == HAND_EYE_CAPTURING:
                     try:
-                        rgbd = img_client.get_rgbd_frame("head_rgbd_camera")
+                        rgbd = img_client.get_rgbd_frame(
+                            "head_rgbd_camera",
+                            request_bgr=False,
+                        )
                         if (
                             rgbd
                             and rgbd.depth is not None
@@ -1254,6 +1297,17 @@ if __name__ == '__main__':
                             )
                             HAND_EYE_CAPTURE.set_capture_progress(captured_frames)
                             if captured_frames >= HAND_EYE_CAPTURE.burst_frames:
+                                try:
+                                    preview_stats = tv_wrapper.set_depth_preview(rgbd.depth)
+                                    logger_mp.info(
+                                        "Hand-eye depth preview displayed in VR: "
+                                        f"valid={preview_stats['valid_ratio'] * 100:.1f}%, "
+                                        f"range={preview_stats['min']}..{preview_stats['max']}."
+                                    )
+                                except Exception as preview_exc:
+                                    logger_mp.error(
+                                        f"Hand-eye depth preview failed: {preview_exc}"
+                                    )
                                 color_topic = hand_eye_camera_config.get("color_camera", "head_camera")
                                 color_cfg = camera_config.get(color_topic, {})
                                 hand_eye_recorder.submit_sample(
@@ -1272,9 +1326,20 @@ if __name__ == '__main__':
                                         ],
                                     }
                                 )
+                                img_client.unsubscribe_rgbd(
+                                    "head_rgbd_camera",
+                                    request_bgr=False,
+                                )
                                 HAND_EYE_CAPTURE.begin_saving()
-                                logger_mp.info("Hand-eye capture: burst complete; saving asynchronously.")
+                                logger_mp.info(
+                                    "Hand-eye capture: burst complete; RGB-D subscriber stopped; "
+                                    "saving asynchronously."
+                                )
                     except Exception as exc:
+                        img_client.unsubscribe_rgbd(
+                            "head_rgbd_camera",
+                            request_bgr=False,
+                        )
                         HAND_EYE_CAPTURE.fail(f"Capture failed: {exc}")
                         if trajectory_recorder is not None:
                             trajectory_recorder.mark_capture_error(str(exc))
@@ -1290,6 +1355,7 @@ if __name__ == '__main__':
                             if trajectory_recorder is not None:
                                 trajectory_recorder.mark_capture_saved(save_result["path"])
                             if replay_mode:
+                                tv_wrapper.clear_depth_preview()
                                 HAND_EYE_CAPTURE.resume_without_rebase()
                                 HAND_EYE_REPLAY.resume_after_event()
                                 logger_mp.info(
@@ -1699,6 +1765,11 @@ if __name__ == '__main__':
         
         try:
             if img_client is not None:
+                if args.hand_eye_record:
+                    img_client.unsubscribe_rgbd(
+                        "head_rgbd_camera",
+                        request_bgr=False,
+                    )
                 img_client.close()
         except Exception as e:
             logger_mp.error(f"Failed to close image client: {e}")
