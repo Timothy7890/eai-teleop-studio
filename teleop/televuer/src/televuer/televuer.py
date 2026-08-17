@@ -1,5 +1,5 @@
 from vuer import Vuer
-from vuer.schemas import HUDPlane, ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
+from vuer.schemas import ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
 from multiprocessing import Value, Array, Process, shared_memory
 import numpy as np
 import asyncio
@@ -222,9 +222,6 @@ class TeleVuer:
     @staticmethod
     def _hud_image(title: str, detail: str, level: int) -> np.ndarray:
         width, height = 1024, 220
-        # HUDPlane's browser implementation reliably accepts an opaque RGB
-        # data URL. Raw binary/transparent textures can fall back to its
-        # default white material on some headset browsers.
         image = Image.new("RGB", (width, height), (8, 20, 36))
         draw = ImageDraw.Draw(image)
         colors = {
@@ -263,15 +260,20 @@ class TeleVuer:
             if version != rendered_version:
                 title, detail, level = self._read_hud_status()
                 if title:
+                    # Vuer's client-side HUDPlane ignores the `src` prop (it
+                    # expects a material mounted as a child), which renders as
+                    # a plain white plane. ImageBackground consumes `src`
+                    # directly and is the same component used for the camera
+                    # feed, so it is known to work on the headset browser.
                     session.upsert(
-                        HUDPlane(
+                        ImageBackground(
                             self._hud_image(title, detail, level),
                             key="teleop-status-hud",
                             position=[0, 0.72, -1.4],
                             height=0.28,
                             aspect=1024 / 220,
                             distanceToCamera=1.4,
-                            format="b64png",
+                            format="png",
                         ),
                         to="bgChildren",
                     )

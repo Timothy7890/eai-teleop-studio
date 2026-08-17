@@ -247,14 +247,26 @@ class HandEyeTrajectoryReplay:
             and np.all(np.isfinite(self.left_fixed_q))
         ):
             raise ValueError("trajectory contains non-finite joint values")
+        raw_events = metadata.get("events", [])
+        if not isinstance(raw_events, list) or not raw_events:
+            raise ValueError(
+                "trajectory contains no capture events; replay would not collect calibration data"
+            )
+        incomplete_events = [
+            event
+            for event in raw_events
+            if not isinstance(event, dict)
+            or event.get("capture_frame_index") is None
+            or event.get("resume_frame_index") is None
+            or event.get("error")
+        ]
+        if incomplete_events:
+            raise ValueError(
+                "trajectory contains incomplete capture events; record each B capture, "
+                "wait for saving, then complete B resume before stopping"
+            )
         self.events = sorted(
-            [
-                event
-                for event in metadata.get("events", [])
-                if event.get("capture_frame_index") is not None
-                and event.get("resume_frame_index") is not None
-                and not event.get("error")
-            ],
+            raw_events,
             key=lambda event: int(event["capture_frame_index"]),
         )
         for event in self.events:

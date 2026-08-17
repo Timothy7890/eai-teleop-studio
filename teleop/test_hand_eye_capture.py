@@ -311,6 +311,9 @@ class HandEyeTrajectoryTest(unittest.TestCase):
                 right_command_q=np.zeros(7),
                 right_measured_q=np.zeros(7),
             )
+            recorder.begin_capture_event(frame_index=0)
+            recorder.mark_capture_saved("episode_0001", frame_index=0)
+            recorder.finish_capture_event(frame_index=0)
             trajectory_dir = recorder.close()
             replay = HandEyeTrajectoryReplay(trajectory_dir, start_tolerance=0.01)
             with self.assertRaises(RuntimeError):
@@ -330,6 +333,9 @@ class HandEyeTrajectoryTest(unittest.TestCase):
                     right_measured_q=np.zeros(7),
                     monotonic_ns=time.monotonic_ns() + index * 30_000_000,
                 )
+            recorder.begin_capture_event(frame_index=2)
+            recorder.mark_capture_saved("episode_0001", frame_index=2)
+            recorder.finish_capture_event(frame_index=2)
             trajectory_dir = recorder.close()
             replay = HandEyeTrajectoryReplay(
                 trajectory_dir,
@@ -341,6 +347,21 @@ class HandEyeTrajectoryTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 replay.check_tracking(np.ones(7))
             self.assertEqual(replay.state, replay.ERROR)
+
+    def test_replay_rejects_trajectory_without_capture_events(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = HandEyeTrajectoryRecorder(
+                temp_dir,
+                left_fixed_q=np.zeros(7),
+                frequency=30,
+            )
+            recorder.add_frame(
+                right_command_q=np.zeros(7),
+                right_measured_q=np.zeros(7),
+            )
+            trajectory_dir = recorder.close()
+            with self.assertRaisesRegex(ValueError, "no capture events"):
+                HandEyeTrajectoryReplay(trajectory_dir)
 
 
 if __name__ == "__main__":

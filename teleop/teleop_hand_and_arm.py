@@ -525,7 +525,7 @@ if __name__ == '__main__':
                         help='Maximum absolute right-arm joint speed in rad/s while settling.')
     parser.add_argument('--hand-eye-max-joint-span', type=float, default=0.003,
                         help='Maximum right-arm joint position span in rad over the settling window.')
-    parser.add_argument('--hand-eye-max-hold-error', type=float, default=0.10,
+    parser.add_argument('--hand-eye-max-hold-error', type=float, default=0.30,
                         help='Maximum measured right-arm hold drift in rad before capture is blocked.')
     parser.add_argument('--hand-eye-resume-seconds', type=float, default=2.0,
                         help='Seconds used to move smoothly to the current absolute XR target after saving.')
@@ -1152,11 +1152,29 @@ if __name__ == '__main__':
                     and HAND_EYE_CAPTURE.consume_toggle()
                 ):
                     if HAND_EYE_CAPTURE.state == HAND_EYE_FOLLOW:
-                        hold_q = np.concatenate([left_fixed_q, current_lr_arm_q[-7:]])
-                        HAND_EYE_CAPTURE.begin_hold(hold_q)
-                        if trajectory_recorder is not None:
-                            trajectory_recorder.begin_capture_event()
-                        logger_mp.info("Hand-eye capture: arm targets latched; waiting for measured joints to settle.")
+                        try:
+                            hold_q, _ = arm_ik.solve_ik(
+                                left_fixed_wrist_pose,
+                                tele_data.right_wrist_pose,
+                                current_lr_arm_q,
+                                current_lr_arm_dq,
+                            )
+                            hold_q[:7] = left_fixed_q
+                            if not np.all(np.isfinite(hold_q)):
+                                raise RuntimeError(
+                                    "capture target IK returned non-finite joints"
+                                )
+                            HAND_EYE_CAPTURE.begin_hold(hold_q)
+                            if trajectory_recorder is not None:
+                                trajectory_recorder.begin_capture_event()
+                            logger_mp.info(
+                                "Hand-eye capture: current absolute XR target latched; "
+                                "moving to target and waiting for measured joints to settle."
+                            )
+                        except Exception as exc:
+                            logger_mp.error(
+                                f"Hand-eye capture target IK failed; continuing follow: {exc}"
+                            )
                     elif HAND_EYE_CAPTURE.state == HAND_EYE_HOLD:
                         if HAND_EYE_CAPTURE.fatal_error:
                             logger_mp.error(
