@@ -79,7 +79,7 @@ class HandEyeCaptureState:
         self,
         *,
         settle_seconds: float = 0.5,
-        max_joint_speed: float = 0.02,
+        max_joint_speed: float = 0.05,
         max_joint_span: float = 0.003,
         max_hold_error: float = 0.05,
         burst_frames: int = 5,
@@ -188,7 +188,7 @@ class HandEyeCaptureState:
                 self._error = "Hold safety failed: measured joints are invalid."
                 self._fatal_error = True
                 return True
-            error = float(np.max(np.abs(q - self._hold_q)))
+            error = float(np.max(np.abs(q[-7:] - self._hold_q[-7:])))
             if error <= self.max_hold_error:
                 return False
             self._state = HOLD
@@ -220,7 +220,11 @@ class HandEyeCaptureState:
         with self._lock:
             if self._state != SETTLING:
                 return False
-            speed_ok = q.shape == (14,) and dq.shape == (14,) and float(np.max(np.abs(dq))) <= self.max_joint_speed
+            speed_ok = (
+                q.shape == (14,)
+                and dq.shape == (14,)
+                and float(np.max(np.abs(dq[-7:]))) <= self.max_joint_speed
+            )
             if not speed_ok:
                 self._stable_since = None
                 self._q_history.clear()
@@ -231,7 +235,7 @@ class HandEyeCaptureState:
             if now - self._stable_since + 1e-9 < self.settle_seconds or len(self._q_history) < 2:
                 return False
             q_values = np.stack([item[1] for item in self._q_history])
-            span = float(np.max(np.ptp(q_values, axis=0)))
+            span = float(np.max(np.ptp(q_values[:, -7:], axis=0)))
             if span > self.max_joint_span:
                 self._stable_since = now
                 self._q_history.clear()

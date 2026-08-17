@@ -520,12 +520,12 @@ if __name__ == '__main__':
                         help='Enable sparse hand-eye RGB-D capture with absolute XR-to-IK following.')
     parser.add_argument('--hand-eye-settle-seconds', type=float, default=0.5,
                         help='Required stable time before a hand-eye burst is captured.')
-    parser.add_argument('--hand-eye-max-joint-speed', type=float, default=0.02,
-                        help='Maximum absolute arm joint speed in rad/s while settling.')
+    parser.add_argument('--hand-eye-max-joint-speed', type=float, default=0.05,
+                        help='Maximum absolute right-arm joint speed in rad/s while settling.')
     parser.add_argument('--hand-eye-max-joint-span', type=float, default=0.003,
-                        help='Maximum arm joint position span in rad over the settling window.')
+                        help='Maximum right-arm joint position span in rad over the settling window.')
     parser.add_argument('--hand-eye-max-hold-error', type=float, default=0.05,
-                        help='Maximum measured hold drift in rad before capture is blocked.')
+                        help='Maximum measured right-arm hold drift in rad before capture is blocked.')
     parser.add_argument('--hand-eye-burst-frames', type=int, default=5,
                         help='Number of unique RGB-D frames saved per hand-eye sample.')
     parser.add_argument('--hand-eye-replay', type=str, default='',

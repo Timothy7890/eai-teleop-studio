@@ -62,6 +62,20 @@ class HandEyeCaptureStateTest(unittest.TestCase):
         self.assertIn("Hold drift", state.snapshot()["HAND_EYE_ERROR"])
         self.assertFalse(state.update_settling(drifted_q, np.zeros(14), now=1.0))
 
+    def test_left_arm_motion_does_not_block_right_arm_settling(self):
+        state = HandEyeCaptureState(
+            settle_seconds=0.5,
+            max_joint_speed=0.05,
+            max_joint_span=0.003,
+        )
+        state.begin_hold(np.zeros(14), now=0.0)
+        left_only_q = np.concatenate([np.ones(7), np.zeros(7)])
+        left_only_dq = np.concatenate([np.ones(7), np.zeros(7)])
+        self.assertFalse(state.check_hold_drift(left_only_q))
+        self.assertFalse(state.update_settling(left_only_q, left_only_dq, now=0.1))
+        self.assertTrue(state.update_settling(left_only_q, left_only_dq, now=0.6))
+        self.assertEqual(state.state, CAPTURING)
+
     def test_rebase_first_frame_is_robot_anchor(self):
         state = HandEyeCaptureState()
         state.begin_hold(np.zeros(14), now=0.0)
