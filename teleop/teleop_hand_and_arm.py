@@ -49,6 +49,7 @@ from teleop.utils.hand_eye_capture import (
     SAVING as HAND_EYE_SAVING,
     SETTLING as HAND_EYE_SETTLING,
     HandEyeCaptureState,
+    build_hand_eye_hud_status,
 )
 from teleop.utils.hand_eye_recorder import HandEyeRecorder
 from teleop.utils.hand_eye_trajectory import (
@@ -137,6 +138,30 @@ def get_state() -> dict:
         state["TRAJECTORY_REPLAY_ENABLED"] = False
     state["HAND_EYE_TRAJECTORY_PATH"] = HAND_EYE_TRAJECTORY_PATH
     return state
+
+
+def update_vr_hud(tv_wrapper, *, started: bool, motion_ready: bool = True) -> None:
+    if HAND_EYE_CAPTURE is not None:
+        title, detail, level = build_hand_eye_hud_status(
+            HAND_EYE_CAPTURE.snapshot(),
+            started=started,
+            motion_ready=motion_ready,
+        )
+    elif not started:
+        title, detail, level = (
+            "等待开始遥操",
+            "确认 VR 追踪正常后，在电脑点击“开始遥操”",
+            "info",
+        )
+    elif not motion_ready:
+        title, detail, level = (
+            "等待 VR 追踪",
+            "确认控制器权限和手柄连接",
+            "warning",
+        )
+    else:
+        title, detail, level = "遥操运行中", "A：结束遥操", "success"
+    tv_wrapper.set_hud_status(title, detail, level)
 
 
 def set_external_arm_target(msg: dict):
@@ -448,6 +473,8 @@ if __name__ == '__main__':
                         help='Maximum absolute arm joint speed in rad/s while settling.')
     parser.add_argument('--hand-eye-max-joint-span', type=float, default=0.003,
                         help='Maximum arm joint position span in rad over the settling window.')
+    parser.add_argument('--hand-eye-max-hold-error', type=float, default=0.05,
+                        help='Maximum measured hold drift in rad before capture is blocked.')
     parser.add_argument('--hand-eye-burst-frames', type=int, default=5,
                         help='Number of unique RGB-D frames saved per hand-eye sample.')
     parser.add_argument('--hand-eye-replay', type=str, default='',
@@ -477,6 +504,7 @@ if __name__ == '__main__':
             settle_seconds=args.hand_eye_settle_seconds,
             max_joint_speed=args.hand_eye_max_joint_speed,
             max_joint_span=args.hand_eye_max_joint_span,
+            max_hold_error=args.hand_eye_max_hold_error,
             burst_frames=args.hand_eye_burst_frames,
         )
     if args.hand_eye_replay:
@@ -868,6 +896,7 @@ if __name__ == '__main__':
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
+        update_vr_hud(tv_wrapper, started=False)
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
             if xr_need_local_img and img_client is not None:
@@ -884,6 +913,7 @@ if __name__ == '__main__':
                         tv_wrapper.render_to_xr(head_img.bgr)
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
+        update_vr_hud(tv_wrapper, started=True, motion_ready=False)
         arm_ctrl.speed_gradual_max()
 
         image_frames = {camera_name: None for camera_name in record_camera_names}
@@ -995,7 +1025,12 @@ if __name__ == '__main__':
                             trajectory_recorder.begin_capture_event()
                         logger_mp.info("Hand-eye capture: arm targets latched; waiting for measured joints to settle.")
                     elif HAND_EYE_CAPTURE.state == HAND_EYE_HOLD:
-                        if not tele_data.motion_data_ready:
+                        if HAND_EYE_CAPTURE.fatal_error:
+                            logger_mp.error(
+                                "Hand-eye rebase blocked after fatal hold safety error; "
+                                "stop teleoperation."
+                            )
+                        elif not tele_data.motion_data_ready:
                             HAND_EYE_CAPTURE.fail("XR motion data is not ready; remaining in HOLD.")
                         else:
                             try:
@@ -1046,6 +1081,14 @@ if __name__ == '__main__':
                         logger_mp.warning(
                             f"Hand-eye toggle ignored while state={HAND_EYE_CAPTURE.state}."
                         )
+
+                if HAND_EYE_CAPTURE.check_hold_drift(current_lr_arm_q):
+                    hold_error = HAND_EYE_CAPTURE.snapshot().get("HAND_EYE_ERROR")
+                    if trajectory_recorder is not None:
+                        trajectory_recorder.mark_capture_error(hold_error or "hold drift")
+                    if replay_mode:
+                        HAND_EYE_REPLAY.abort(hold_error or "hold drift")
+                    logger_mp.critical(f"Hand-eye hold safety violation: {hold_error}")
 
                 if HAND_EYE_CAPTURE.state == HAND_EYE_SETTLING:
                     if HAND_EYE_CAPTURE.update_settling(current_lr_arm_q, current_lr_arm_dq):
@@ -1136,6 +1179,11 @@ if __name__ == '__main__':
                 }
                 READY = HAND_EYE_CAPTURE.state in {HAND_EYE_FOLLOW, HAND_EYE_HOLD}
 
+            update_vr_hud(
+                tv_wrapper,
+                started=True,
+                motion_ready=tele_data.motion_data_ready,
+            )
             control_input_ready = (
                 tele_data.motion_data_ready
                 or external_arm_target is not None
@@ -1165,6 +1213,11 @@ if __name__ == '__main__':
             if args.input_mode == "controller" and args.motion and tele_data.motion_data_ready:
                 # quit teleoperate
                 if tele_data.right_ctrl_aButton:
+                    tv_wrapper.set_hud_status(
+                        "正在结束遥操…",
+                        "机器人将返回安全初始姿态",
+                        "warning",
+                    )
                     START = False
                     STOP = True
                 # command robot to enter damping mode. soft emergency stop function
@@ -1223,7 +1276,9 @@ if __name__ == '__main__':
                 )
             if args.hand_eye_record:
                 sol_q[:7] = left_fixed_q
-                sol_tauff[:7] = 0.0
+                # H2 arm_sdk needs gravity feedforward even while q is latched.
+                # Zeroing tau_ff here lets a raised arm sag/fall before settling.
+                sol_tauff = arm_ik.gravity_torques(sol_q)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             if control_input_ready:

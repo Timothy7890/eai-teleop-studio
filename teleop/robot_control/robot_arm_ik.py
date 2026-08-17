@@ -1431,6 +1431,25 @@ class H2_ArmIK:
         right_pose = np.asarray(self.reduced_robot.data.oMf[self.R_hand_id].homogeneous).copy()
         return left_pose, right_pose
 
+    def gravity_torques(self, dual_arm_q):
+        """Return gravity compensation torques for a finite 14-DoF arm state."""
+        q = np.asarray(dual_arm_q, dtype=float)
+        if q.shape != (self.reduced_robot.model.nq,) or not np.all(np.isfinite(q)):
+            raise ValueError(
+                f"H2 gravity compensation expects {self.reduced_robot.model.nq} finite joint values, got {q.shape}"
+            )
+        zeros = np.zeros(self.reduced_robot.model.nv)
+        tau = np.asarray(
+            pin.rnea(self.reduced_robot.model, self.reduced_robot.data, q, zeros, zeros),
+            dtype=float,
+        )
+        effort_limits = np.asarray(self.reduced_robot.model.effortLimit, dtype=float)
+        if tau.shape != q.shape or not np.all(np.isfinite(tau)):
+            raise RuntimeError("H2 gravity compensation returned invalid torques")
+        if effort_limits.shape == tau.shape and np.any(np.abs(tau) > effort_limits):
+            raise RuntimeError("H2 gravity compensation exceeds URDF effort limits")
+        return tau
+
     def reset_solution(self, dual_arm_q):
         """Reset IK warm-start and smoothing state to a measured hold pose."""
         q = np.asarray(dual_arm_q, dtype=float)

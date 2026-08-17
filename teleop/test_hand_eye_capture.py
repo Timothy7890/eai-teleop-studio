@@ -12,6 +12,7 @@ from teleop.utils.hand_eye_capture import (
     HOLD,
     SAVING,
     HandEyeCaptureState,
+    build_hand_eye_hud_status,
 )
 from teleop.utils.hand_eye_recorder import HandEyeRecorder
 from teleop.utils.hand_eye_trajectory import (
@@ -50,6 +51,17 @@ class HandEyeCaptureStateTest(unittest.TestCase):
         self.assertTrue(state.update_settling(q, np.zeros(14), now=0.7))
         self.assertEqual(state.state, CAPTURING)
 
+    def test_hold_drift_is_fatal_and_blocks_capture(self):
+        state = HandEyeCaptureState(max_hold_error=0.05)
+        state.begin_hold(np.zeros(14), now=0.0)
+        drifted_q = np.zeros(14)
+        drifted_q[-1] = 0.051
+        self.assertTrue(state.check_hold_drift(drifted_q))
+        self.assertEqual(state.state, HOLD)
+        self.assertTrue(state.fatal_error)
+        self.assertIn("Hold drift", state.snapshot()["HAND_EYE_ERROR"])
+        self.assertFalse(state.update_settling(drifted_q, np.zeros(14), now=1.0))
+
     def test_rebase_first_frame_is_robot_anchor(self):
         state = HandEyeCaptureState()
         state.begin_hold(np.zeros(14), now=0.0)
@@ -73,6 +85,40 @@ class HandEyeCaptureStateTest(unittest.TestCase):
         self.assertEqual(state.state, FOLLOW)
         moved_left, _ = state.apply_rebase(pose(1.1, 2.0, 3.0), right_xr)
         np.testing.assert_allclose(moved_left[:3, 3], [0.3, 0.3, 0.4])
+
+    def test_hud_status_tracks_capture_lifecycle(self):
+        waiting = build_hand_eye_hud_status({}, started=False)
+        self.assertEqual(waiting[0], "等待开始遥操")
+
+        following = build_hand_eye_hud_status(
+            {
+                "HAND_EYE_STATE": FOLLOW,
+                "HAND_EYE_SAVED_SAMPLES": 2,
+            },
+            started=True,
+        )
+        self.assertIn("已保存 2 条", following[0])
+        self.assertIn("B：锁定并采样", following[1])
+
+        capturing = build_hand_eye_hud_status(
+            {
+                "HAND_EYE_STATE": CAPTURING,
+                "HAND_EYE_CAPTURED_FRAMES": 3,
+                "HAND_EYE_BURST_FRAMES": 5,
+            },
+            started=True,
+        )
+        self.assertIn("3 / 5", capturing[0])
+
+        hold = build_hand_eye_hud_status(
+            {
+                "HAND_EYE_STATE": HOLD,
+                "HAND_EYE_SAVED_SAMPLES": 3,
+            },
+            started=True,
+        )
+        self.assertIn("第 3 条已保存", hold[0])
+        self.assertIn("重新对齐", hold[1])
 
 
 class HandEyeRecorderTest(unittest.TestCase):

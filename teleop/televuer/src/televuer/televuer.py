@@ -1,5 +1,5 @@
 from vuer import Vuer
-from vuer.schemas import ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
+from vuer.schemas import HUDPlane, ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
 from multiprocessing import Value, Array, Process, shared_memory
 import numpy as np
 import asyncio
@@ -7,6 +7,7 @@ import threading
 import cv2
 import os
 import time
+from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 from typing import Literal
 
@@ -104,6 +105,11 @@ class TeleVuer:
         self._controller_move_error_log_time = 0.0
         self._hand_move_event_count = 0
         self._hand_move_error_log_time = 0.0
+        self._hud_capacity = 2048
+        self._hud_text_shared = Array('B', self._hud_capacity, lock=True)
+        self._hud_level_shared = Value('i', 0, lock=True)
+        self._hud_version_shared = Value('L', 0, lock=True)
+        self._hud_last_payload = None
 
         if self.display_mode == "immersive":
             if self.webrtc:
@@ -138,7 +144,8 @@ class TeleVuer:
         else:
             raise ValueError(f"[TeleVuer] Unknown display_mode: {self.display_mode}")
         
-        self.vuer.spawn(start=False)(fn)
+        self._scene_fn = fn
+        self.vuer.spawn(start=False)(self._main_scene_with_hud)
 
         self.head_pose_shared = Array('d', 16, lock=True)
         self.left_arm_pose_shared = Array('d', 16, lock=True)
@@ -181,6 +188,92 @@ class TeleVuer:
         self.process = Process(target=self._vuer_run)
         self.process.daemon = True
         self.process.start()
+
+    async def _main_scene_with_hud(self, session):
+        await asyncio.gather(
+            self._scene_fn(session),
+            self._main_hud(session),
+        )
+
+    def set_hud_status(self, title: str, detail: str = "", level: str = "info") -> None:
+        level_codes = {"info": 0, "success": 1, "warning": 2, "error": 3}
+        payload = f"{title}\n{detail}".encode("utf-8")[: self._hud_capacity - 1]
+        signature = (payload, level_codes.get(level, 0))
+        if signature == self._hud_last_payload:
+            return
+        self._hud_last_payload = signature
+        with self._hud_text_shared.get_lock():
+            self._hud_text_shared[: len(payload)] = payload
+            self._hud_text_shared[len(payload)] = 0
+        with self._hud_level_shared.get_lock():
+            self._hud_level_shared.value = signature[1]
+        with self._hud_version_shared.get_lock():
+            self._hud_version_shared.value += 1
+
+    def _read_hud_status(self) -> tuple[str, str, int]:
+        with self._hud_text_shared.get_lock():
+            raw = bytes(self._hud_text_shared[:])
+        payload = raw.split(b"\0", 1)[0].decode("utf-8", errors="replace")
+        title, _, detail = payload.partition("\n")
+        with self._hud_level_shared.get_lock():
+            level = int(self._hud_level_shared.value)
+        return title, detail, level
+
+    @staticmethod
+    def _hud_image(title: str, detail: str, level: int) -> np.ndarray:
+        width, height = 1024, 220
+        image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        colors = {
+            0: (70, 170, 255, 255),
+            1: (52, 211, 153, 255),
+            2: (251, 191, 36, 255),
+            3: (248, 113, 113, 255),
+        }
+        accent = colors.get(level, colors[0])
+        draw.rounded_rectangle(
+            (8, 8, width - 8, height - 8),
+            radius=26,
+            fill=(8, 20, 36, 225),
+            outline=accent,
+            width=6,
+        )
+        font_path = os.environ.get(
+            "XR_TELEOP_HUD_FONT",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        )
+        try:
+            title_font = ImageFont.truetype(font_path, 52)
+            detail_font = ImageFont.truetype(font_path, 34)
+        except OSError:
+            title_font = ImageFont.load_default()
+            detail_font = ImageFont.load_default()
+        draw.text((42, 30), title, font=title_font, fill=(255, 255, 255, 255))
+        draw.text((42, 122), detail, font=detail_font, fill=(218, 230, 242, 255))
+        return np.asarray(image)
+
+    async def _main_hud(self, session):
+        rendered_version = -1
+        while True:
+            with self._hud_version_shared.get_lock():
+                version = int(self._hud_version_shared.value)
+            if version != rendered_version:
+                title, detail, level = self._read_hud_status()
+                if title:
+                    session.upsert(
+                        HUDPlane(
+                            self._hud_image(title, detail, level),
+                            key="teleop-status-hud",
+                            position=[0, 0.72, -1.4],
+                            height=0.28,
+                            aspect=1024 / 220,
+                            distanceToCamera=1.4,
+                            format="png",
+                        ),
+                        to="bgChildren",
+                    )
+                rendered_version = version
+            await asyncio.sleep(0.1)
     
     def _vuer_run(self):
         try:

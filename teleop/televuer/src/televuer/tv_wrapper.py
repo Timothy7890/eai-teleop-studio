@@ -456,6 +456,9 @@ class TeleVuerWrapper:
         
     def render_to_xr(self, img):
         self.tvuer.render_to_xr(img)
+
+    def set_hud_status(self, title: str, detail: str = "", level: str = "info"):
+        self.tvuer.set_hud_status(title, detail, level)
     
     def close(self):
         self.tvuer.close()

@@ -16,6 +16,37 @@ SAVING = "SAVING"
 HOLD = "HOLD"
 
 
+def build_hand_eye_hud_status(
+    snapshot: dict,
+    *,
+    started: bool,
+    motion_ready: bool = True,
+) -> tuple[str, str, str]:
+    """Build a concise Chinese VR HUD message from capture state."""
+    if not started:
+        return "等待开始遥操", "连接右手柄后，在电脑点击“开始遥操”", "info"
+
+    state = snapshot.get("HAND_EYE_STATE", FOLLOW)
+    saved = int(snapshot.get("HAND_EYE_SAVED_SAMPLES", 0) or 0)
+    captured = int(snapshot.get("HAND_EYE_CAPTURED_FRAMES", 0) or 0)
+    burst = int(snapshot.get("HAND_EYE_BURST_FRAMES", 1) or 1)
+    error = snapshot.get("HAND_EYE_ERROR")
+
+    if error:
+        return "采集错误 · 机器人保持中", str(error)[:80], "error"
+    if state == SETTLING:
+        return "关节判稳中…", "机器人已锁定，请等待", "warning"
+    if state == CAPTURING:
+        return f"RGB-D 采集中 {captured} / {burst}", "请等待采集完成", "warning"
+    if state == SAVING:
+        return "数据保存中…", "请勿退出，等待写盘完成", "warning"
+    if state == HOLD:
+        return f"第 {saved} 条已保存", "B：重新对齐并恢复遥操　A：结束", "success"
+    if not motion_ready:
+        return "等待右手柄追踪", "确认 VR 控制器权限和手柄连接", "warning"
+    return f"遥操中 · 已保存 {saved} 条", "B：锁定并采样　A：结束遥操", "success"
+
+
 def _pose(value: np.ndarray) -> np.ndarray:
     pose = np.asarray(value, dtype=float)
     if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
@@ -45,17 +76,19 @@ class HandEyeCaptureState:
         settle_seconds: float = 0.5,
         max_joint_speed: float = 0.02,
         max_joint_span: float = 0.003,
+        max_hold_error: float = 0.05,
         burst_frames: int = 5,
     ):
         if settle_seconds <= 0:
             raise ValueError("settle_seconds must be positive")
-        if max_joint_speed <= 0 or max_joint_span <= 0:
+        if max_joint_speed <= 0 or max_joint_span <= 0 or max_hold_error <= 0:
             raise ValueError("joint thresholds must be positive")
         if burst_frames <= 0:
             raise ValueError("burst_frames must be positive")
         self.settle_seconds = float(settle_seconds)
         self.max_joint_speed = float(max_joint_speed)
         self.max_joint_span = float(max_joint_span)
+        self.max_hold_error = float(max_hold_error)
         self.burst_frames = int(burst_frames)
         self._lock = threading.RLock()
         self._state = FOLLOW
@@ -69,6 +102,7 @@ class HandEyeCaptureState:
         self._saved_samples = 0
         self._last_sample: Optional[str] = None
         self._error: Optional[str] = None
+        self._fatal_error = False
 
     @property
     def state(self) -> str:
@@ -83,6 +117,11 @@ class HandEyeCaptureState:
     @property
     def is_holding(self) -> bool:
         return self.state != FOLLOW
+
+    @property
+    def fatal_error(self) -> bool:
+        with self._lock:
+            return self._fatal_error
 
     def observe_button(self, pressed: bool) -> bool:
         """Queue one toggle on a rising edge and return whether it fired."""
@@ -116,7 +155,34 @@ class HandEyeCaptureState:
             self._q_history.clear()
             self._captured_frames = 0
             self._error = None
+            self._fatal_error = False
             self._append_q(now if now is not None else time.monotonic(), q)
+
+    def check_hold_drift(self, current_q: np.ndarray) -> bool:
+        """Latch a fatal HOLD error if measured joints leave the commanded hold pose."""
+        q = np.asarray(current_q, dtype=float)
+        with self._lock:
+            if self._state == FOLLOW or self._hold_q is None:
+                return False
+            if self._fatal_error:
+                return False
+            if q.shape != (14,) or not np.all(np.isfinite(q)):
+                self._state = HOLD
+                self._error = "Hold safety failed: measured joints are invalid."
+                self._fatal_error = True
+                return True
+            error = float(np.max(np.abs(q - self._hold_q)))
+            if error <= self.max_hold_error:
+                return False
+            self._state = HOLD
+            self._error = (
+                f"Hold drift {error:.5f} rad exceeds {self.max_hold_error:.5f} rad; "
+                "capture blocked, stop teleoperation."
+            )
+            self._fatal_error = True
+            self._stable_since = None
+            self._q_history.clear()
+            return True
 
     def _append_q(self, now: float, q: np.ndarray) -> None:
         self._q_history.append((now, q.copy()))
@@ -177,10 +243,11 @@ class HandEyeCaptureState:
             self._last_sample = str(sample_path)
             self._error = None
 
-    def fail(self, message: str) -> None:
+    def fail(self, message: str, *, fatal: bool = False) -> None:
         with self._lock:
             self._state = HOLD
             self._error = str(message)
+            self._fatal_error = bool(fatal)
 
     def preview_rebase(
         self,
@@ -221,6 +288,7 @@ class HandEyeCaptureState:
         self._q_history.clear()
         self._captured_frames = 0
         self._error = None
+        self._fatal_error = False
 
     def apply_rebase(self, left_xr: np.ndarray, right_xr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         with self._lock:
@@ -238,4 +306,5 @@ class HandEyeCaptureState:
                 "HAND_EYE_SAVED_SAMPLES": self._saved_samples,
                 "HAND_EYE_LAST_SAMPLE": self._last_sample,
                 "HAND_EYE_ERROR": self._error,
+                "HAND_EYE_FATAL_ERROR": self._fatal_error,
             }
