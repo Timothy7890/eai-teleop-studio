@@ -84,7 +84,7 @@ class HandEyeCaptureState:
         settle_seconds: float = 0.5,
         max_joint_speed: float = 0.05,
         max_joint_span: float = 0.003,
-        max_hold_error: float = 0.05,
+        max_hold_error: float = 0.10,
         burst_frames: int = 5,
     ):
         if settle_seconds <= 0:

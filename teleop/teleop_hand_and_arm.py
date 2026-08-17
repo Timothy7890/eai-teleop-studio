@@ -525,7 +525,7 @@ if __name__ == '__main__':
                         help='Maximum absolute right-arm joint speed in rad/s while settling.')
     parser.add_argument('--hand-eye-max-joint-span', type=float, default=0.003,
                         help='Maximum right-arm joint position span in rad over the settling window.')
-    parser.add_argument('--hand-eye-max-hold-error', type=float, default=0.05,
+    parser.add_argument('--hand-eye-max-hold-error', type=float, default=0.10,
                         help='Maximum measured right-arm hold drift in rad before capture is blocked.')
     parser.add_argument('--hand-eye-resume-seconds', type=float, default=2.0,
                         help='Seconds used to move smoothly to the current absolute XR target after saving.')
