@@ -14,6 +14,10 @@ from teleop.utils.hand_eye_capture import (
     HandEyeCaptureState,
 )
 from teleop.utils.hand_eye_recorder import HandEyeRecorder
+from teleop.utils.hand_eye_trajectory import (
+    HandEyeTrajectoryRecorder,
+    HandEyeTrajectoryReplay,
+)
 
 
 def pose(x=0.0, y=0.0, z=0.0):
@@ -127,6 +131,111 @@ class HandEyeRecorderTest(unittest.TestCase):
             np.testing.assert_array_equal(saved_depth, depth)
             self.assertEqual(frame["states"]["right_arm"]["qpos"], list(np.arange(7, dtype=float)))
             self.assertEqual(frame["timestamps"]["rgbd_timestamp_ns"], 123)
+
+
+class HandEyeTrajectoryTest(unittest.TestCase):
+    def test_records_exact_frames_events_and_replays_sequentially(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            left_fixed = np.arange(7, dtype=float) * 0.01
+            recorder = HandEyeTrajectoryRecorder(
+                temp_dir,
+                left_fixed_q=left_fixed,
+                frequency=30,
+            )
+            base_time = time.monotonic_ns()
+            commands = [
+                np.zeros(7),
+                np.ones(7) * 0.1,
+                np.ones(7) * 0.2,
+            ]
+            measured = [
+                np.zeros(7),
+                np.ones(7) * 0.09,
+                np.ones(7) * 0.19,
+            ]
+            recorder.add_frame(
+                right_command_q=commands[0],
+                right_measured_q=measured[0],
+                monotonic_ns=base_time,
+            )
+            recorder.begin_capture_event(frame_index=0)
+            recorder.add_frame(
+                right_command_q=commands[1],
+                right_measured_q=measured[1],
+                monotonic_ns=base_time + 40_000_000,
+            )
+            recorder.mark_capture_saved("episode_0001", frame_index=1)
+            recorder.finish_capture_event(frame_index=2)
+            recorder.add_frame(
+                right_command_q=commands[2],
+                right_measured_q=measured[2],
+                monotonic_ns=base_time + 80_000_000,
+            )
+            trajectory_dir = recorder.close()
+
+            with np.load(trajectory_dir / "trajectory.npz", allow_pickle=False) as data:
+                np.testing.assert_array_equal(data["right_command_q"], commands)
+                np.testing.assert_array_equal(data["right_measured_q"], measured)
+                np.testing.assert_array_equal(data["left_fixed_q"], left_fixed)
+            events = json.loads((trajectory_dir / "events.json").read_text(encoding="utf-8"))
+            self.assertTrue(events["completed"])
+            self.assertEqual(events["events"][0]["capture_frame_index"], 1)
+            self.assertEqual(events["events"][0]["resume_frame_index"], 2)
+
+            replay = HandEyeTrajectoryReplay(trajectory_dir)
+            replay.start(np.concatenate([left_fixed, measured[0]]))
+            np.testing.assert_array_equal(replay.target_right_q, commands[0])
+            self.assertIsNone(replay.advance())
+            np.testing.assert_array_equal(replay.target_right_q, commands[1])
+            event = replay.advance()
+            self.assertEqual(event["episode"], "episode_0001")
+            self.assertEqual(replay.state, replay.EVENT_HOLD)
+            replay.resume_after_event()
+            np.testing.assert_array_equal(replay.target_right_q, commands[2])
+            replay.advance()
+            self.assertEqual(replay.state, replay.COMPLETED)
+
+    def test_replay_rejects_unmatched_start_pose(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = HandEyeTrajectoryRecorder(
+                temp_dir,
+                left_fixed_q=np.zeros(7),
+                frequency=30,
+            )
+            recorder.add_frame(
+                right_command_q=np.zeros(7),
+                right_measured_q=np.zeros(7),
+            )
+            trajectory_dir = recorder.close()
+            replay = HandEyeTrajectoryReplay(trajectory_dir, start_tolerance=0.01)
+            with self.assertRaises(RuntimeError):
+                replay.start(np.ones(14))
+            self.assertEqual(replay.state, replay.ERROR)
+
+    def test_replay_aborts_after_persistent_tracking_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = HandEyeTrajectoryRecorder(
+                temp_dir,
+                left_fixed_q=np.zeros(7),
+                frequency=30,
+            )
+            for index in range(3):
+                recorder.add_frame(
+                    right_command_q=np.zeros(7),
+                    right_measured_q=np.zeros(7),
+                    monotonic_ns=time.monotonic_ns() + index * 30_000_000,
+                )
+            trajectory_dir = recorder.close()
+            replay = HandEyeTrajectoryReplay(
+                trajectory_dir,
+                tracking_error_limit=0.05,
+                tracking_error_frames=2,
+            )
+            replay.start(np.zeros(14))
+            replay.check_tracking(np.ones(7))
+            with self.assertRaises(RuntimeError):
+                replay.check_tracking(np.ones(7))
+            self.assertEqual(replay.state, replay.ERROR)
 
 
 if __name__ == "__main__":

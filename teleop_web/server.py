@@ -343,6 +343,8 @@ DEFAULT_DEVICE = {
     "headless": False,
     "motion": True,
     "hand_eye_record": False,
+    "hand_eye_replay_trajectory": "",
+    "hand_eye_replay_time_scale": 1.0,
     "ik_replay_live_enable": False,
     "ik_replay_live_url": DEFAULT_IK_REPLAY_LIVE_URL,
     "ik_replay_live_fps": 10,
@@ -497,8 +499,23 @@ def validate_device(raw: Any) -> dict[str, Any]:
     device["headless"] = bool(device.get("headless", False))
     device["motion"] = bool(device.get("motion", False))
     device["hand_eye_record"] = bool(device.get("hand_eye_record", False))
+    replay_trajectory = str(device.get("hand_eye_replay_trajectory", "") or "").strip()
+    if "\x00" in replay_trajectory:
+        raise ValidationError("手眼轨迹路径不正确")
+    device["hand_eye_replay_trajectory"] = (
+        _project_path_for_config(replay_trajectory) if replay_trajectory else ""
+    )
+    try:
+        replay_time_scale = float(device.get("hand_eye_replay_time_scale", 1.0))
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("轨迹回放速度倍率必须是数字") from exc
+    if not 0.1 <= replay_time_scale <= 1.0:
+        raise ValidationError("轨迹回放速度倍率必须在 0.1 到 1.0 之间")
+    device["hand_eye_replay_time_scale"] = replay_time_scale
+    if replay_trajectory:
+        device["hand_eye_record"] = True
     if device["hand_eye_record"] and device["arm"] != "H2":
-        raise ValidationError("手眼标定采集模式目前仅支持 H2")
+        raise ValidationError("手眼标定采集/回放模式目前仅支持 H2")
     device["ik_replay_live_enable"] = bool(device.get("ik_replay_live_enable", False))
     ik_replay_live_url = str(device.get("ik_replay_live_url", "") or "").strip()
     if device["ik_replay_live_enable"]:
@@ -622,6 +639,10 @@ def build_command(device: dict[str, Any], task: dict[str, str], dataset_root: Pa
         command.append("--motion")
     if device.get("hand_eye_record"):
         command.append("--hand-eye-record")
+    if device.get("hand_eye_replay_trajectory"):
+        replay_path = _project_path_for_runtime(str(device["hand_eye_replay_trajectory"]))
+        command.append(f"--hand-eye-replay={replay_path}")
+        command.append(f"--hand-eye-replay-time-scale={device.get('hand_eye_replay_time_scale', 1):g}")
     if device.get("ik_replay_live_enable") and device.get("ik_replay_live_url"):
         command.append("--ik-replay-live-enable")
         command.append(f"--ik-replay-live-url={device['ik_replay_live_url']}")

@@ -51,6 +51,10 @@ from teleop.utils.hand_eye_capture import (
     HandEyeCaptureState,
 )
 from teleop.utils.hand_eye_recorder import HandEyeRecorder
+from teleop.utils.hand_eye_trajectory import (
+    HandEyeTrajectoryRecorder,
+    HandEyeTrajectoryReplay,
+)
 from teleop.utils.ik_replay_live import IKReplayLivePusher, build_ik_replay_live_payload
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
@@ -81,6 +85,8 @@ EXTERNAL_ARM_TARGET = None
 EXTERNAL_ARM_TARGET_LOCK = threading.Lock()
 EXTERNAL_ARM_TARGET_TIMEOUT = 0.5
 HAND_EYE_CAPTURE = None
+HAND_EYE_REPLAY = None
+HAND_EYE_TRAJECTORY_PATH = None
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -125,6 +131,11 @@ def get_state() -> dict:
         state.update({"HAND_EYE_ENABLED": True, **HAND_EYE_CAPTURE.snapshot()})
     else:
         state["HAND_EYE_ENABLED"] = False
+    if HAND_EYE_REPLAY is not None:
+        state.update({"TRAJECTORY_REPLAY_ENABLED": True, **HAND_EYE_REPLAY.progress})
+    else:
+        state["TRAJECTORY_REPLAY_ENABLED"] = False
+    state["HAND_EYE_TRAJECTORY_PATH"] = HAND_EYE_TRAJECTORY_PATH
     return state
 
 
@@ -439,6 +450,14 @@ if __name__ == '__main__':
                         help='Maximum arm joint position span in rad over the settling window.')
     parser.add_argument('--hand-eye-burst-frames', type=int, default=5,
                         help='Number of unique RGB-D frames saved per hand-eye sample.')
+    parser.add_argument('--hand-eye-replay', type=str, default='',
+                        help='Completed trajectory directory or trajectory.npz to replay without XR control.')
+    parser.add_argument('--hand-eye-replay-time-scale', type=float, default=1.0,
+                        help='Replay speed in (0, 1]; preserves every recorded joint-space sample.')
+    parser.add_argument('--hand-eye-replay-start-tolerance', type=float, default=0.05,
+                        help='Maximum initial joint mismatch in rad before replay is rejected.')
+    parser.add_argument('--hand-eye-replay-tracking-limit', type=float, default=0.08,
+                        help='Maximum persistent measured trajectory error in rad.')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
     parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
@@ -446,6 +465,9 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    args.hand_eye_replay = args.hand_eye_replay.strip()
+    if args.hand_eye_replay:
+        args.hand_eye_record = True
     if args.hand_eye_record and args.arm != "H2":
         raise ValueError("--hand-eye-record currently supports only --arm=H2.")
     if args.hand_eye_record and not args.record:
@@ -456,6 +478,13 @@ if __name__ == '__main__':
             max_joint_speed=args.hand_eye_max_joint_speed,
             max_joint_span=args.hand_eye_max_joint_span,
             burst_frames=args.hand_eye_burst_frames,
+        )
+    if args.hand_eye_replay:
+        HAND_EYE_REPLAY = HandEyeTrajectoryReplay(
+            args.hand_eye_replay,
+            start_tolerance=args.hand_eye_replay_start_tolerance,
+            tracking_error_limit=args.hand_eye_replay_tracking_limit,
+            time_scale=args.hand_eye_replay_time_scale,
         )
     if args.arm_reference_mode is None:
         args.arm_reference_mode = 'head_position' if args.arm == 'H2' else 'head_yaw'
@@ -506,6 +535,9 @@ if __name__ == '__main__':
     ik_replay_pusher = None
     recorder = None
     hand_eye_recorder = None
+    trajectory_recorder = None
+    left_fixed_q = None
+    left_fixed_wrist_pose = None
 
     try:
         # setup dds communication domains id
@@ -684,6 +716,34 @@ if __name__ == '__main__':
                 move_h2_to_pose(arm_ctrl, init_arm_q, h2_locked_targets, args.init_arm_pose_duration)
             else:
                 move_dual_arm_to_pose(arm_ctrl, init_arm_q, args.init_arm_pose_duration)
+
+        if args.hand_eye_record:
+            current_arm_q = arm_ctrl.get_current_dual_arm_q()
+            if HAND_EYE_REPLAY is not None:
+                left_fixed_q = HAND_EYE_REPLAY.left_fixed_q.copy()
+                logger_mp.info(
+                    f"Hand-eye deterministic replay loaded: {HAND_EYE_REPLAY.directory}, "
+                    f"frames={HAND_EYE_REPLAY.right_command_q.shape[0]}, "
+                    f"events={len(HAND_EYE_REPLAY.events)}"
+                )
+            else:
+                left_fixed_q = current_arm_q[:7].copy()
+                trajectory_recorder = HandEyeTrajectoryRecorder(
+                    os.path.join(args.task_dir, args.task_name),
+                    left_fixed_q=left_fixed_q,
+                    frequency=args.frequency,
+                )
+                HAND_EYE_TRAJECTORY_PATH = str(trajectory_recorder.directory)
+                logger_mp.info(
+                    f"Hand-eye trajectory recording started: {trajectory_recorder.directory}"
+                )
+                arm_ctrl.ctrl_dual_arm(
+                    np.concatenate([left_fixed_q, current_arm_q[-7:]]),
+                    np.zeros(14),
+                )
+            left_fixed_wrist_pose, _ = arm_ik.forward_wrist_poses(
+                np.concatenate([left_fixed_q, current_arm_q[-7:]])
+            )
 
         # end-effector
         xr_motion_data_ready = Value('b', False, lock=True)        # [input] whether XR hand/controller motion data has arrived
@@ -910,11 +970,29 @@ if __name__ == '__main__':
 
             hand_eye_holding = False
             if args.hand_eye_record:
-                if args.input_mode == "controller":
+                replay_mode = HAND_EYE_REPLAY is not None
+                if replay_mode and HAND_EYE_REPLAY.state == HAND_EYE_REPLAY.WAITING:
+                    HAND_EYE_REPLAY.start(current_lr_arm_q)
+                    logger_mp.info("Hand-eye deterministic replay started.")
+                if (
+                    replay_mode
+                    and HAND_EYE_REPLAY.state == HAND_EYE_REPLAY.EVENT_HOLD
+                    and HAND_EYE_CAPTURE.state == HAND_EYE_FOLLOW
+                ):
+                    replay_hold_q = np.concatenate([left_fixed_q, current_lr_arm_q[-7:]])
+                    HAND_EYE_CAPTURE.begin_hold(replay_hold_q)
+                    logger_mp.info(
+                        f"Hand-eye replay reached capture event at frame {HAND_EYE_REPLAY.index}."
+                    )
+
+                if not replay_mode and args.input_mode == "controller":
                     HAND_EYE_CAPTURE.observe_button(tele_data.right_ctrl_bButton)
-                if HAND_EYE_CAPTURE.consume_toggle():
+                if not replay_mode and HAND_EYE_CAPTURE.consume_toggle():
                     if HAND_EYE_CAPTURE.state == HAND_EYE_FOLLOW:
-                        HAND_EYE_CAPTURE.begin_hold(current_lr_arm_q)
+                        hold_q = np.concatenate([left_fixed_q, current_lr_arm_q[-7:]])
+                        HAND_EYE_CAPTURE.begin_hold(hold_q)
+                        if trajectory_recorder is not None:
+                            trajectory_recorder.begin_capture_event()
                         logger_mp.info("Hand-eye capture: arm targets latched; waiting for measured joints to settle.")
                     elif HAND_EYE_CAPTURE.state == HAND_EYE_HOLD:
                         if not tele_data.motion_data_ready:
@@ -933,6 +1011,7 @@ if __name__ == '__main__':
                                     tele_data.left_wrist_pose,
                                     tele_data.right_wrist_pose,
                                 )
+                                left_target = left_fixed_wrist_pose
                                 arm_ik.reset_solution(hold_q)
                                 resume_q, _ = arm_ik.solve_ik(
                                     left_target,
@@ -940,6 +1019,7 @@ if __name__ == '__main__':
                                     hold_q,
                                     np.zeros_like(hold_q),
                                 )
+                                resume_q[:7] = left_fixed_q
                                 resume_delta = float(np.max(np.abs(resume_q - hold_q)))
                                 if resume_delta > 0.02:
                                     arm_ik.reset_solution(hold_q)
@@ -948,11 +1028,19 @@ if __name__ == '__main__':
                                     )
                                 else:
                                     HAND_EYE_CAPTURE.commit_rebase(anchors)
+                                    if trajectory_recorder is not None:
+                                        last_frame_index = trajectory_recorder.last_frame_index
+                                        next_frame_index = (
+                                            -1 if last_frame_index is None else last_frame_index
+                                        ) + 1
+                                        trajectory_recorder.finish_capture_event(next_frame_index)
                                     logger_mp.info(
                                         f"Hand-eye capture: XR rebase committed; first IK delta={resume_delta:.5f} rad."
                                     )
                             except Exception as exc:
                                 HAND_EYE_CAPTURE.fail(f"Rebase failed: {exc}")
+                                if trajectory_recorder is not None:
+                                    trajectory_recorder.mark_capture_error(str(exc))
                                 logger_mp.error(f"Hand-eye rebase failed: {exc}")
                     else:
                         logger_mp.warning(
@@ -1006,6 +1094,10 @@ if __name__ == '__main__':
                                 logger_mp.info("Hand-eye capture: burst complete; saving asynchronously.")
                     except Exception as exc:
                         HAND_EYE_CAPTURE.fail(f"Capture failed: {exc}")
+                        if trajectory_recorder is not None:
+                            trajectory_recorder.mark_capture_error(str(exc))
+                        if replay_mode:
+                            HAND_EYE_REPLAY.abort(f"Capture failed: {exc}")
                         logger_mp.error(f"Hand-eye capture failed: {exc}")
 
                 if HAND_EYE_CAPTURE.state == HAND_EYE_SAVING:
@@ -1013,12 +1105,28 @@ if __name__ == '__main__':
                     if save_result is not None:
                         if save_result.get("ok"):
                             HAND_EYE_CAPTURE.finish_saving(save_result["path"])
+                            if trajectory_recorder is not None:
+                                trajectory_recorder.mark_capture_saved(save_result["path"])
+                            if replay_mode:
+                                HAND_EYE_CAPTURE.resume_without_rebase()
+                                HAND_EYE_REPLAY.resume_after_event()
+                                logger_mp.info(
+                                    f"Hand-eye replay resumed at trajectory frame {HAND_EYE_REPLAY.index}."
+                                )
                             logger_mp.info(
                                 f"Hand-eye sample saved: {save_result['path']} "
                                 f"({save_result['frame_count']} frames)."
                             )
                         else:
                             HAND_EYE_CAPTURE.fail(save_result.get("error", "unknown save error"))
+                            if trajectory_recorder is not None:
+                                trajectory_recorder.mark_capture_error(
+                                    save_result.get("error", "unknown save error")
+                                )
+                            if replay_mode:
+                                HAND_EYE_REPLAY.abort(
+                                    save_result.get("error", "unknown save error")
+                                )
                             logger_mp.error(f"Hand-eye sample save failed: {save_result}")
 
                 hand_eye_holding = HAND_EYE_CAPTURE.is_holding
@@ -1032,11 +1140,13 @@ if __name__ == '__main__':
                 tele_data.motion_data_ready
                 or external_arm_target is not None
                 or hand_eye_holding
+                or HAND_EYE_REPLAY is not None
             )
             if (
                 not tele_data.motion_data_ready
                 and external_arm_target is None
                 and not hand_eye_holding
+                and HAND_EYE_REPLAY is None
             ):
                 waiting_motion_log_count += 1
                 if waiting_motion_log_count % max(1, int(args.frequency)) == 0:
@@ -1081,6 +1191,15 @@ if __name__ == '__main__':
             if hand_eye_holding:
                 sol_q = HAND_EYE_CAPTURE.hold_q
                 sol_tauff = np.zeros_like(sol_q)
+            elif HAND_EYE_REPLAY is not None:
+                if HAND_EYE_REPLAY.state == HAND_EYE_REPLAY.ERROR:
+                    raise RuntimeError(HAND_EYE_REPLAY.error or "trajectory replay failed")
+                HAND_EYE_REPLAY.check_tracking(current_lr_arm_q[-7:])
+                sol_q = np.concatenate([
+                    HAND_EYE_REPLAY.left_fixed_q,
+                    HAND_EYE_REPLAY.target_right_q,
+                ])
+                sol_tauff = np.zeros_like(sol_q)
             elif not control_input_ready:
                 sol_q = current_lr_arm_q.copy()
                 sol_tauff = np.zeros_like(sol_q)
@@ -1091,20 +1210,34 @@ if __name__ == '__main__':
                 left_wrist_target = tele_data.left_wrist_pose
                 right_wrist_target = tele_data.right_wrist_pose
                 if args.hand_eye_record:
-                    left_wrist_target, right_wrist_target = HAND_EYE_CAPTURE.apply_rebase(
+                    _, right_wrist_target = HAND_EYE_CAPTURE.apply_rebase(
                         left_wrist_target,
                         right_wrist_target,
                     )
+                    left_wrist_target = left_fixed_wrist_pose
                 sol_q, sol_tauff = arm_ik.solve_ik(
                     left_wrist_target,
                     right_wrist_target,
                     current_lr_arm_q,
                     current_lr_arm_dq,
                 )
+            if args.hand_eye_record:
+                sol_q[:7] = left_fixed_q
+                sol_tauff[:7] = 0.0
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             if control_input_ready:
                 arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+            if trajectory_recorder is not None:
+                trajectory_recorder.add_frame(
+                    right_command_q=sol_q[-7:],
+                    right_measured_q=current_lr_arm_q[-7:],
+                )
+            if (
+                HAND_EYE_REPLAY is not None
+                and HAND_EYE_REPLAY.state == HAND_EYE_REPLAY.PLAYING
+            ):
+                HAND_EYE_REPLAY.advance()
             if ik_replay_pusher is not None and ik_replay_pusher.enabled:
                 ik_replay_pusher.publish(build_ik_replay_live_payload(
                     robot=args.arm.lower(),
@@ -1274,7 +1407,14 @@ if __name__ == '__main__':
 
             current_time = time.time()
             time_elapsed = current_time - start_time
-            sleep_time = max(0, (1 / args.frequency) - time_elapsed)
+            loop_period = 1 / args.frequency
+            if (
+                HAND_EYE_REPLAY is not None
+                and HAND_EYE_REPLAY.state == HAND_EYE_REPLAY.PLAYING
+                and HAND_EYE_REPLAY.last_interval_seconds > 0
+            ):
+                loop_period = HAND_EYE_REPLAY.last_interval_seconds
+            sleep_time = max(0, loop_period - time_elapsed)
             time.sleep(sleep_time)
             logger_mp.debug(f"main process sleep: {sleep_time}")
 
@@ -1354,5 +1494,11 @@ if __name__ == '__main__':
                 hand_eye_recorder.close()
         except Exception as e:
             logger_mp.error(f"Failed to close hand-eye recorder: {e}")
+        try:
+            if trajectory_recorder is not None:
+                trajectory_path = trajectory_recorder.close()
+                logger_mp.info(f"Hand-eye trajectory finalized: {trajectory_path}")
+        except Exception as e:
+            logger_mp.error(f"Failed to close hand-eye trajectory recorder: {e}")
         logger_mp.info("✅ Finally, exiting program.")
         exit(0)

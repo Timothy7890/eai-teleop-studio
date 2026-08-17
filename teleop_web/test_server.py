@@ -77,6 +77,34 @@ class ValidationTests(unittest.TestCase):
                 "hand_eye_record": True,
             })
 
+    def test_h2_trajectory_replay_builds_exact_path_and_time_scale(self):
+        device = validate_device({
+            "arm": "H2",
+            "input_mode": "controller",
+            "ee": "none",
+            "hand_eye_replay_trajectory": "/tmp/trajectory_0001",
+            "hand_eye_replay_time_scale": 0.5,
+        })
+        task = validate_task({
+            "name": "hand_eye_replay",
+            "instruction": "Replay exact hand eye trajectory",
+            "description": "手眼轨迹回放",
+        })
+        command = build_command(device, task, Path("/tmp/datasets"))
+        self.assertTrue(device["hand_eye_record"])
+        self.assertIn("--hand-eye-record", command)
+        self.assertIn("--hand-eye-replay=/tmp/trajectory_0001", command)
+        self.assertIn("--hand-eye-replay-time-scale=0.5", command)
+
+    def test_trajectory_replay_rejects_non_h2_robot(self):
+        with self.assertRaises(ValidationError):
+            validate_device({
+                "arm": "G1_29",
+                "input_mode": "controller",
+                "ee": "none",
+                "hand_eye_replay_trajectory": "/tmp/trajectory_0001",
+            })
+
     def test_invalid_xr_view_is_rejected(self):
         with self.assertRaises(ValidationError):
             validate_device({"xr_view": "wrist_only"})

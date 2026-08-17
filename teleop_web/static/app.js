@@ -1534,6 +1534,8 @@ function renderRuntime() {
   $('#controlSubtitle').textContent = `${current.device_name} · ${current.description}`;
   const handEyeEnabled = Boolean(teleop.HAND_EYE_ENABLED);
   const handEyeState = teleop.HAND_EYE_STATE || 'FOLLOW';
+  const replayEnabled = Boolean(teleop.TRAJECTORY_REPLAY_ENABLED);
+  const replayState = teleop.TRAJECTORY_REPLAY_STATE || 'WAITING';
   const handEyeStatus = {
     FOLLOW: '手眼标定：遥操运行中',
     SETTLING: '手眼标定：双臂锁定，判稳中',
@@ -1543,6 +1545,14 @@ function renderRuntime() {
   };
   let processStatus = !process.running ? `已退出 (${process.exit_code ?? '—'})` : (teleop.RECORD_RUNNING ? '正在录制' : teleop.START ? '遥操运行中' : teleop.online ? '等待开始遥操' : '初始化中');
   if (handEyeEnabled && teleop.START) processStatus = handEyeStatus[handEyeState] || processStatus;
+  const replayStatus = {
+    WAITING: '轨迹回放：等待开始',
+    PLAYING: `轨迹回放：${teleop.TRAJECTORY_REPLAY_INDEX || 0} / ${teleop.TRAJECTORY_REPLAY_FRAMES || 0}`,
+    EVENT_HOLD: '轨迹回放：关键帧判稳与拍摄中',
+    COMPLETED: '轨迹回放完成，保持最终姿态',
+    ERROR: `轨迹回放失败：${teleop.TRAJECTORY_REPLAY_ERROR || '未知错误'}`,
+  };
+  if (replayEnabled && teleop.START) processStatus = replayStatus[replayState] || processStatus;
   if (teleop.HAND_EYE_ERROR) processStatus += `；${teleop.HAND_EYE_ERROR}`;
   $('#processStatus').textContent = runtimePending?.message || processStatus;
   $('#episodeProgress').textContent = `${latest.existing_episodes ?? 0} / ${latest.target_episodes ?? 0}`;
@@ -1553,9 +1563,9 @@ function renderRuntime() {
   renderCameraPreview();
   const ready = process.running && teleop.online;
   $('#startControl').disabled = Boolean(runtimePending) || !ready || Boolean(teleop.START);
-  $('#startControl').textContent = runtimePending?.type === 'teleop_start' ? '开始遥操指令已发送...' : '开始遥操';
+  $('#startControl').textContent = runtimePending?.type === 'teleop_start' ? '开始指令已发送...' : (replayEnabled ? '开始轨迹回放' : '开始遥操');
   $('#recordControl').hidden = handEyeEnabled;
-  $('#handEyeControl').hidden = !handEyeEnabled;
+  $('#handEyeControl').hidden = !handEyeEnabled || replayEnabled;
   const canStartRecording = ready && teleop.START && teleop.READY;
   const canStopRecording = process.running && Boolean(teleop.RECORD_RUNNING);
   $('#recordControl').disabled = Boolean(runtimePending) || !(canStartRecording || canStopRecording);
@@ -1752,7 +1762,7 @@ document.addEventListener('pointerdown', event => {
 
 function fillDeviceForm(device) {
   const form = $('#deviceForm'); form.reset();
-  const values = device ? {name:device.name,...device.config,xr_view:device.config.xr_view || 'head',arm_reference_mode:device.config.arm_reference_mode || 'head_position',img_server_ip:device.config.img_server_ip || DEFAULT_IMAGE_SERVER_IP,webrtc_server_ip:device.config.webrtc_server_ip || DEFAULT_WEBRTC_SERVER_IP,data_dir:device.config.data_dir || appState.data_dir || DEFAULT_DATA_DIR,init_arm_pose_file:device.config.init_arm_pose_file || '',init_arm_pose_duration:device.config.init_arm_pose_duration || 5,hand_eye_record:Boolean(device.config.hand_eye_record),ik_replay_live_url:device.config.ik_replay_live_url || DEFAULT_IK_REPLAY_LIVE_URL,ik_replay_live_fps:device.config.ik_replay_live_fps || 10} : {arm:'H2',left_ee:'none',right_ee:'inspire_dfx',input_mode:'hand',display_mode:'pass-through',xr_view:'head',arm_reference_mode:'head_position',img_server_ip:DEFAULT_IMAGE_SERVER_IP,webrtc_server_ip:DEFAULT_WEBRTC_SERVER_IP,data_dir:appState.data_dir || DEFAULT_DATA_DIR,network_interface:'enp86s0',frequency:30,init_arm_pose_file:DEFAULT_H2_INIT_ARM_POSE_FILE,init_arm_pose_duration:5,headless:true,motion:true,hand_eye_record:false,ik_replay_live_enable:false,ik_replay_live_url:DEFAULT_IK_REPLAY_LIVE_URL,ik_replay_live_fps:10};
+  const values = device ? {name:device.name,...device.config,xr_view:device.config.xr_view || 'head',arm_reference_mode:device.config.arm_reference_mode || 'head_position',img_server_ip:device.config.img_server_ip || DEFAULT_IMAGE_SERVER_IP,webrtc_server_ip:device.config.webrtc_server_ip || DEFAULT_WEBRTC_SERVER_IP,data_dir:device.config.data_dir || appState.data_dir || DEFAULT_DATA_DIR,init_arm_pose_file:device.config.init_arm_pose_file || '',init_arm_pose_duration:device.config.init_arm_pose_duration || 5,hand_eye_replay_trajectory:device.config.hand_eye_replay_trajectory || '',hand_eye_replay_time_scale:device.config.hand_eye_replay_time_scale || 1,hand_eye_record:Boolean(device.config.hand_eye_record),ik_replay_live_url:device.config.ik_replay_live_url || DEFAULT_IK_REPLAY_LIVE_URL,ik_replay_live_fps:device.config.ik_replay_live_fps || 10} : {arm:'H2',left_ee:'none',right_ee:'inspire_dfx',input_mode:'hand',display_mode:'pass-through',xr_view:'head',arm_reference_mode:'head_position',img_server_ip:DEFAULT_IMAGE_SERVER_IP,webrtc_server_ip:DEFAULT_WEBRTC_SERVER_IP,data_dir:appState.data_dir || DEFAULT_DATA_DIR,network_interface:'enp86s0',frequency:30,init_arm_pose_file:DEFAULT_H2_INIT_ARM_POSE_FILE,init_arm_pose_duration:5,headless:true,motion:true,hand_eye_replay_trajectory:'',hand_eye_replay_time_scale:1,hand_eye_record:false,ik_replay_live_enable:false,ik_replay_live_url:DEFAULT_IK_REPLAY_LIVE_URL,ik_replay_live_fps:10};
   if (values.ee && !values.left_ee && !values.right_ee) {
     values.left_ee = values.ee;
     values.right_ee = values.ee;
@@ -2172,7 +2182,7 @@ $('#taskPageJump')?.addEventListener('blur', event => jumpTaskPage(event.current
 $('#deviceForm').addEventListener('submit', async event => {
   event.preventDefault(); const f=new FormData(event.currentTarget);
   const leftEe=f.get('left_ee'), rightEe=f.get('right_ee');
-  const device={name:f.get('name'),arm:f.get('arm'),ee:leftEe===rightEe?leftEe:'none',left_ee:leftEe,right_ee:rightEe,input_mode:f.get('input_mode'),display_mode:f.get('display_mode'),xr_view:f.get('xr_view') || 'head',arm_reference_mode:f.get('arm_reference_mode') || 'head_position',img_server_ip:f.get('img_server_ip') || DEFAULT_IMAGE_SERVER_IP,webrtc_server_ip:f.get('webrtc_server_ip') || DEFAULT_WEBRTC_SERVER_IP,data_dir:f.get('data_dir') || DEFAULT_DATA_DIR,network_interface:f.get('network_interface'),frequency:Number(f.get('frequency')),init_arm_pose_file:f.get('init_arm_pose_file') || '',init_arm_pose_duration:Number(f.get('init_arm_pose_duration') || 5),headless:f.has('headless'),motion:f.has('motion'),hand_eye_record:f.has('hand_eye_record'),ik_replay_live_enable:f.has('ik_replay_live_enable'),ik_replay_live_url:f.get('ik_replay_live_url') || DEFAULT_IK_REPLAY_LIVE_URL,ik_replay_live_fps:Number(f.get('ik_replay_live_fps') || 10)};
+  const device={name:f.get('name'),arm:f.get('arm'),ee:leftEe===rightEe?leftEe:'none',left_ee:leftEe,right_ee:rightEe,input_mode:f.get('input_mode'),display_mode:f.get('display_mode'),xr_view:f.get('xr_view') || 'head',arm_reference_mode:f.get('arm_reference_mode') || 'head_position',img_server_ip:f.get('img_server_ip') || DEFAULT_IMAGE_SERVER_IP,webrtc_server_ip:f.get('webrtc_server_ip') || DEFAULT_WEBRTC_SERVER_IP,data_dir:f.get('data_dir') || DEFAULT_DATA_DIR,network_interface:f.get('network_interface'),frequency:Number(f.get('frequency')),init_arm_pose_file:f.get('init_arm_pose_file') || '',init_arm_pose_duration:Number(f.get('init_arm_pose_duration') || 5),headless:f.has('headless'),motion:f.has('motion'),hand_eye_replay_trajectory:f.get('hand_eye_replay_trajectory') || '',hand_eye_replay_time_scale:Number(f.get('hand_eye_replay_time_scale') || 1),hand_eye_record:f.has('hand_eye_record'),ik_replay_live_enable:f.has('ik_replay_live_enable'),ik_replay_live_url:f.get('ik_replay_live_url') || DEFAULT_IK_REPLAY_LIVE_URL,ik_replay_live_fps:Number(f.get('ik_replay_live_fps') || 10)};
   try { deviceFormDirty=false; applyState(await api('/api/device/save',{device})); showNotice('设备配置文件已更新','success'); } catch(error){deviceFormDirty=true;showNotice(error.message);}
 });
 $('#deviceForm').addEventListener('input',()=>deviceFormDirty=true);

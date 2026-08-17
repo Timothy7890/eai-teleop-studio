@@ -204,11 +204,23 @@ class HandEyeCaptureState:
             if self._state != HOLD:
                 raise RuntimeError(f"cannot commit rebase from {self._state}")
             self._anchors = anchors
-            self._state = FOLLOW
-            self._hold_q = None
-            self._stable_since = None
-            self._q_history.clear()
-            self._error = None
+            self._resume_follow()
+
+    def resume_without_rebase(self) -> None:
+        """Resume deterministic replay after HOLD without consulting XR poses."""
+        with self._lock:
+            if self._state != HOLD:
+                raise RuntimeError(f"cannot resume from {self._state}")
+            self._resume_follow()
+
+    def _resume_follow(self) -> None:
+        """Reset hold bookkeeping. Caller must own _lock."""
+        self._state = FOLLOW
+        self._hold_q = None
+        self._stable_since = None
+        self._q_history.clear()
+        self._captured_frames = 0
+        self._error = None
 
     def apply_rebase(self, left_xr: np.ndarray, right_xr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         with self._lock:
