@@ -10,34 +10,40 @@ head_camera:
   usb_interface: '1.4'
   video_index: 0
   image_shape:
-  - 480
-  - 640
-  binocular: false
-  fps: 30
-  video_id: 22
-  serial_number: CP0BB53000FS
-  physical_path: /sys/devices/pci0000:00/0000:00:14.0/usb3/3-4/3-4:1.4
-head_depth_camera:
-  enable_zmq: false
-  zmq_port: 55559
-  enable_webrtc: false
-  webrtc_port: null
-  type: opencv_depth
-  data_format: depth_z16
-  fourcc: 'Z16 '
-  ffmpeg_input_format: gray16le
-  depth_dtype: uint16
-  direct_video_id: true
-  usb_interface: '1.0'
-  video_index: 0
-  image_shape:
-  - 480
-  - 640
+  - 1080
+  - 1920
   binocular: false
   fps: 30
   video_id: null
   serial_number: CP0BB53000FS
   physical_path: null
+head_rgbd_camera:
+  enable_zmq: true
+  zmq_port: 55560
+  enable_webrtc: true
+  webrtc_port: null
+  type: rgbd
+  data_format: rgbd
+  color_camera: head_camera
+  depth_dtype: uint16
+  fps: 30
+  depth:
+    type: opencv_depth
+    data_format: depth_z16
+    fourcc: 'Z16 '
+    ffmpeg_input_format: gray16le
+    depth_dtype: uint16
+    direct_video_id: true
+    usb_interface: '1.0'
+    video_index: 0
+    image_shape:
+    - 800
+    - 1280
+    binocular: false
+    fps: 30
+    video_id: null
+    serial_number: CP0BB53000FS
+    physical_path: null
 torso_camera:
   enable_zmq: true
   zmq_port: 55556
@@ -54,9 +60,9 @@ torso_camera:
   - 640
   binocular: false
   fps: 30
-  video_id: 12
-  serial_number: CPCBC530002E
-  physical_path: /sys/devices/pci0000:00/0000:00:14.0/usb4/4-4/4-4:1.4
+  video_id: null
+  serial_number: CP0F463000WM
+  physical_path: null
 left_wrist_camera:
   enable_zmq: true
   zmq_port: 55557
@@ -69,13 +75,13 @@ left_wrist_camera:
   usb_interface: '1.4'
   video_index: 0
   image_shape:
-  - 480
-  - 640
+  - 1080
+  - 1920
   binocular: false
   fps: 30
-  video_id: 6
-  serial_number: CP0BB530009R
-  physical_path: /sys/devices/pci0000:00/0000:00:14.0/usb3/3-3/3-3:1.4
+  video_id: null
+  serial_number: CP0X663000D0
+  physical_path: null
 right_wrist_camera:
   enable_zmq: true
   zmq_port: 55558
@@ -85,13 +91,13 @@ right_wrist_camera:
   type: opencv
   fourcc: YUYV
   direct_video_id: true
-  usb_interface: '1.0'
-  video_index: 4
+  usb_interface: '1.4'
+  video_index: 0
   image_shape:
-  - 480
-  - 640
+  - 1080
+  - 1920
   binocular: false
   fps: 30
-  video_id: 28
-  serial_number: 260523073107
-  physical_path: /sys/devices/pci0000:00/0000:00:14.0/usb4/4-2/4-2:1.0
+  video_id: null
+  serial_number: CP0T26300058
+  physical_path: null
