@@ -222,7 +222,10 @@ class TeleVuer:
     @staticmethod
     def _hud_image(title: str, detail: str, level: int) -> np.ndarray:
         width, height = 1024, 220
-        image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        # HUDPlane's browser implementation reliably accepts an opaque RGB
+        # data URL. Raw binary/transparent textures can fall back to its
+        # default white material on some headset browsers.
+        image = Image.new("RGB", (width, height), (8, 20, 36))
         draw = ImageDraw.Draw(image)
         colors = {
             0: (70, 170, 255, 255),
@@ -234,7 +237,7 @@ class TeleVuer:
         draw.rounded_rectangle(
             (8, 8, width - 8, height - 8),
             radius=26,
-            fill=(8, 20, 36, 225),
+            fill=(8, 20, 36),
             outline=accent,
             width=6,
         )
@@ -248,8 +251,8 @@ class TeleVuer:
         except OSError:
             title_font = ImageFont.load_default()
             detail_font = ImageFont.load_default()
-        draw.text((42, 30), title, font=title_font, fill=(255, 255, 255, 255))
-        draw.text((42, 122), detail, font=detail_font, fill=(218, 230, 242, 255))
+        draw.text((42, 30), title, font=title_font, fill=(255, 255, 255))
+        draw.text((42, 122), detail, font=detail_font, fill=(218, 230, 242))
         return np.asarray(image)
 
     async def _main_hud(self, session):
@@ -268,7 +271,7 @@ class TeleVuer:
                             height=0.28,
                             aspect=1024 / 220,
                             distanceToCamera=1.4,
-                            format="png",
+                            format="b64png",
                         ),
                         to="bgChildren",
                     )

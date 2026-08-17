@@ -24,7 +24,7 @@ def build_hand_eye_hud_status(
 ) -> tuple[str, str, str]:
     """Build a concise Chinese VR HUD message from capture state."""
     if not started:
-        return "等待开始遥操", "连接右手柄后，在电脑点击“开始遥操”", "info"
+        return "等待开始遥操", "确认追踪后按 A，或在电脑点击“开始遥操”", "info"
 
     state = snapshot.get("HAND_EYE_STATE", FOLLOW)
     saved = int(snapshot.get("HAND_EYE_SAVED_SAMPLES", 0) or 0)
@@ -265,6 +265,25 @@ class HandEyeCaptureState:
             left_xr=_pose(left_xr),
             right_xr=_pose(right_xr),
         )
+
+    def initialize_rebase(
+        self,
+        left_xr: np.ndarray,
+        right_xr: np.ndarray,
+        left_robot: np.ndarray,
+        right_robot: np.ndarray,
+    ) -> None:
+        """Anchor initial XR motion to the robot's current measured wrist poses."""
+        anchors = RebaseAnchors(
+            left_robot=_pose(left_robot),
+            right_robot=_pose(right_robot),
+            left_xr=_pose(left_xr),
+            right_xr=_pose(right_xr),
+        )
+        with self._lock:
+            if self._state != FOLLOW:
+                raise RuntimeError(f"cannot initialize rebase from {self._state}")
+            self._anchors = anchors
 
     def commit_rebase(self, anchors: RebaseAnchors) -> None:
         with self._lock:

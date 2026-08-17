@@ -86,9 +86,21 @@ class HandEyeCaptureStateTest(unittest.TestCase):
         moved_left, _ = state.apply_rebase(pose(1.1, 2.0, 3.0), right_xr)
         np.testing.assert_allclose(moved_left[:3, 3], [0.3, 0.3, 0.4])
 
+    def test_initial_rebase_starts_from_current_robot_pose(self):
+        state = HandEyeCaptureState()
+        left_xr = pose(1.0, 2.0, 3.0)
+        right_xr = pose(-1.0, 2.0, 3.0)
+        left_robot = pose(0.2, 0.3, 0.4)
+        right_robot = pose(0.2, -0.3, 0.4)
+        state.initialize_rebase(left_xr, right_xr, left_robot, right_robot)
+        first_left, first_right = state.apply_rebase(left_xr, right_xr)
+        np.testing.assert_allclose(first_left, left_robot)
+        np.testing.assert_allclose(first_right, right_robot)
+
     def test_hud_status_tracks_capture_lifecycle(self):
         waiting = build_hand_eye_hud_status({}, started=False)
         self.assertEqual(waiting[0], "等待开始遥操")
+        self.assertIn("按 A", waiting[1])
 
         following = build_hand_eye_hud_status(
             {

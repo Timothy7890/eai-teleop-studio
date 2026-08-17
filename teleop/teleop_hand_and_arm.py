@@ -150,7 +150,7 @@ def update_vr_hud(tv_wrapper, *, started: bool, motion_ready: bool = True) -> No
     elif not started:
         title, detail, level = (
             "等待开始遥操",
-            "确认 VR 追踪正常后，在电脑点击“开始遥操”",
+            "确认追踪后按 A，或在电脑点击“开始遥操”",
             "info",
         )
     elif not motion_ready:
@@ -379,30 +379,69 @@ def load_h2_pose_targets(path):
             locked_joint_targets[joint_index] = float(convert_pose_values([positions[name]], unit)[0])
     return init_arm_q, locked_joint_targets
 
-def move_dual_arm_to_pose(arm_ctrl, target_q, duration=5.0, respect_stop=True):
-    logger_mp.info(f"Moving dual arms to init pose over {duration:.2f}s: {target_q}")
-    arm_ctrl.speed_gradual_max(duration)
-    tau = np.zeros_like(target_q)
-    deadline = time.time() + max(duration, 0.1)
-    while time.time() < deadline and (not respect_stop or not STOP):
-        arm_ctrl.ctrl_dual_arm(target_q, tau)
+def smoothstep_progress(progress):
+    progress = float(np.clip(progress, 0.0, 1.0))
+    return progress * progress * (3.0 - 2.0 * progress)
+
+
+def move_dual_arm_to_pose(
+    arm_ctrl,
+    target_q,
+    duration=5.0,
+    respect_stop=True,
+    gravity_torques=None,
+):
+    duration = max(float(duration), 0.1)
+    target_q = np.asarray(target_q, dtype=float)
+    start_q = arm_ctrl.get_current_dual_arm_q()
+    logger_mp.info(f"Moving dual arms smoothly over {duration:.2f}s: {target_q}")
+    start_time = time.monotonic()
+    deadline = start_time + duration
+    while time.monotonic() < deadline and (not respect_stop or not STOP):
+        alpha = smoothstep_progress((time.monotonic() - start_time) / duration)
+        command_q = start_q + (target_q - start_q) * alpha
+        tau = (
+            gravity_torques(command_q)
+            if gravity_torques is not None
+            else np.zeros_like(command_q)
+        )
+        arm_ctrl.ctrl_dual_arm(command_q, tau)
         time.sleep(0.004)
+    if respect_stop and STOP:
+        return
+    final_tau = (
+        gravity_torques(target_q)
+        if gravity_torques is not None
+        else np.zeros_like(target_q)
+    )
+    arm_ctrl.ctrl_dual_arm(target_q, final_tau)
 
 
 
-def move_h2_to_pose(arm_ctrl, target_arm_q, locked_joint_targets=None, duration=5.0, respect_stop=True):
+def move_h2_to_pose(
+    arm_ctrl,
+    target_arm_q,
+    locked_joint_targets=None,
+    duration=5.0,
+    respect_stop=True,
+    gravity_torques=None,
+):
     locked_joint_targets = locked_joint_targets or {}
     if not locked_joint_targets:
-        move_dual_arm_to_pose(arm_ctrl, target_arm_q, duration, respect_stop)
+        move_dual_arm_to_pose(
+            arm_ctrl,
+            target_arm_q,
+            duration,
+            respect_stop,
+            gravity_torques,
+        )
         return
 
     logger_mp.info(
         f"Moving H2 arms and locked body joints to init pose over {duration:.2f}s; "
         f"locked joints: {[joint.name for joint in locked_joint_targets]}"
     )
-    arm_ctrl.speed_gradual_max(duration)
-    tau = np.zeros_like(target_arm_q)
-    start_time = time.time()
+    start_time = time.monotonic()
     duration = max(duration, 0.1)
     deadline = start_time + duration
     start_arm_q = arm_ctrl.get_current_dual_arm_q()
@@ -411,19 +450,31 @@ def move_h2_to_pose(arm_ctrl, target_arm_q, locked_joint_targets=None, duration=
         joint: float(current_motor_q[joint]) for joint in locked_joint_targets
     }
 
-    while time.time() < deadline and (not respect_stop or not STOP):
-        alpha = min(1.0, (time.time() - start_time) / duration)
+    while time.monotonic() < deadline and (not respect_stop or not STOP):
+        alpha = smoothstep_progress((time.monotonic() - start_time) / duration)
         arm_q = start_arm_q + (target_arm_q - start_arm_q) * alpha
         body_q = {
             joint: start_locked_targets[joint] + (target_q - start_locked_targets[joint]) * alpha
             for joint, target_q in locked_joint_targets.items()
         }
         arm_ctrl.set_locked_joint_targets(body_q)
+        tau = (
+            gravity_torques(arm_q)
+            if gravity_torques is not None
+            else np.zeros_like(arm_q)
+        )
         arm_ctrl.ctrl_dual_arm(arm_q, tau)
         time.sleep(0.004)
 
+    if respect_stop and STOP:
+        return
     arm_ctrl.set_locked_joint_targets(locked_joint_targets)
-    arm_ctrl.ctrl_dual_arm(target_arm_q, tau)
+    final_tau = (
+        gravity_torques(target_arm_q)
+        if gravity_torques is not None
+        else np.zeros_like(target_arm_q)
+    )
+    arm_ctrl.ctrl_dual_arm(target_arm_q, final_tau)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -552,6 +603,8 @@ if __name__ == '__main__':
             logger_mp.warning(f"Default H2 init arm pose file not found: {default_h2_init_pose}")
     if args.exit_arm_pose_duration is None:
         args.exit_arm_pose_duration = args.init_arm_pose_duration
+    if args.hand_eye_record:
+        args.exit_arm_pose_duration = max(args.exit_arm_pose_duration, 5.0)
     logger_mp.debug(f"args: {args}")
 
     # 先设置为空，避免无相机模式退出时找不到该变量
@@ -560,6 +613,7 @@ if __name__ == '__main__':
     motion_switcher = None
     init_arm_q = None
     init_locked_joint_targets = {}
+    initial_hand_eye_rebase_pending = False
     ik_replay_pusher = None
     recorder = None
     hand_eye_recorder = None
@@ -740,8 +794,20 @@ if __name__ == '__main__':
             if init_arm_q.shape[0] != current_dim:
                 raise ValueError(f"Init arm pose dim {init_arm_q.shape[0]} does not match current arm dim {current_dim}")
             if args.arm == "H2":
-                h2_locked_targets = {} if args.motion else init_locked_joint_targets
-                move_h2_to_pose(arm_ctrl, init_arm_q, h2_locked_targets, args.init_arm_pose_duration)
+                if args.hand_eye_record and HAND_EYE_REPLAY is None:
+                    logger_mp.info(
+                        "Hand-eye capture keeps the measured startup arm pose; "
+                        "the configured init pose is reserved for smooth safe exit."
+                    )
+                else:
+                    h2_locked_targets = {} if args.motion else init_locked_joint_targets
+                    move_h2_to_pose(
+                        arm_ctrl,
+                        init_arm_q,
+                        h2_locked_targets,
+                        args.init_arm_pose_duration,
+                        gravity_torques=arm_ik.gravity_torques,
+                    )
             else:
                 move_dual_arm_to_pose(arm_ctrl, init_arm_q, args.init_arm_pose_duration)
 
@@ -767,11 +833,14 @@ if __name__ == '__main__':
                 )
                 arm_ctrl.ctrl_dual_arm(
                     np.concatenate([left_fixed_q, current_arm_q[-7:]]),
-                    np.zeros(14),
+                    arm_ik.gravity_torques(
+                        np.concatenate([left_fixed_q, current_arm_q[-7:]])
+                    ),
                 )
             left_fixed_wrist_pose, _ = arm_ik.forward_wrist_poses(
                 np.concatenate([left_fixed_q, current_arm_q[-7:]])
             )
+            initial_hand_eye_rebase_pending = HAND_EYE_REPLAY is None
 
         # end-effector
         xr_motion_data_ready = Value('b', False, lock=True)        # [input] whether XR hand/controller motion data has arrived
@@ -886,7 +955,7 @@ if __name__ == '__main__':
             )
 
         logger_mp.info("----------------------------------------------------------------")
-        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+        logger_mp.info("🟢  Press controller [A], Web start, or [r] to begin teleoperation.")
         if args.hand_eye_record:
             logger_mp.info("🟠  Press controller [B] or use the Web button to hold/capture, then press again to rebase.")
         elif args.record:
@@ -897,8 +966,24 @@ if __name__ == '__main__':
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
         update_vr_hud(tv_wrapper, started=False)
+        a_button_was_pressed = False
+        a_start_armed = False
+        tele_data = tv_wrapper.get_tele_data()
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
+            tele_data = tv_wrapper.get_tele_data()
+            a_button_pressed = bool(
+                args.input_mode == "controller"
+                and tele_data.motion_data_ready
+                and tele_data.right_ctrl_aButton
+            )
+            if args.input_mode == "controller" and tele_data.motion_data_ready:
+                if not a_button_pressed:
+                    a_start_armed = True
+                elif a_start_armed and not a_button_was_pressed:
+                    START = True
+                    logger_mp.info("Teleoperation start requested by controller A button.")
+            a_button_was_pressed = a_button_pressed
             if xr_need_local_img and img_client is not None:
                 image_frames = {}
                 for camera_name in runtime_camera_names:
@@ -912,6 +997,13 @@ if __name__ == '__main__':
                     if head_img is not None and head_img.bgr is not None:
                         tv_wrapper.render_to_xr(head_img.bgr)
 
+        # A may still be held after starting. Require a release and a new
+        # rising edge before treating A as an exit request.
+        a_button_was_pressed = bool(
+            args.input_mode == "controller"
+            and tele_data.motion_data_ready
+            and tele_data.right_ctrl_aButton
+        )
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         update_vr_hud(tv_wrapper, started=True, motion_ready=False)
         arm_ctrl.speed_gradual_max()
@@ -1001,6 +1093,26 @@ if __name__ == '__main__':
             hand_eye_holding = False
             if args.hand_eye_record:
                 replay_mode = HAND_EYE_REPLAY is not None
+                if initial_hand_eye_rebase_pending and tele_data.motion_data_ready:
+                    initial_anchor_q = np.concatenate([
+                        left_fixed_q,
+                        current_lr_arm_q[-7:],
+                    ])
+                    left_robot, right_robot = arm_ik.forward_wrist_poses(
+                        initial_anchor_q
+                    )
+                    HAND_EYE_CAPTURE.initialize_rebase(
+                        tele_data.left_wrist_pose,
+                        tele_data.right_wrist_pose,
+                        left_robot,
+                        right_robot,
+                    )
+                    arm_ik.reset_solution(initial_anchor_q)
+                    initial_hand_eye_rebase_pending = False
+                    logger_mp.info(
+                        "Hand-eye initial XR anchor set from the current measured "
+                        "right-arm pose."
+                    )
                 if replay_mode and HAND_EYE_REPLAY.state == HAND_EYE_REPLAY.WAITING:
                     HAND_EYE_REPLAY.start(current_lr_arm_q)
                     logger_mp.info("Hand-eye deterministic replay started.")
@@ -1209,17 +1321,26 @@ if __name__ == '__main__':
             else:
                 waiting_motion_log_count = 0
              
-            # high level control
+            # A toggles teleoperation only on a rising edge. This prevents the
+            # same press used to start from immediately stopping the process.
+            a_button_pressed = bool(
+                args.input_mode == "controller"
+                and tele_data.motion_data_ready
+                and tele_data.right_ctrl_aButton
+            )
+            a_button_rising = a_button_pressed and not a_button_was_pressed
+            a_button_was_pressed = a_button_pressed
+            if a_button_rising:
+                tv_wrapper.set_hud_status(
+                    "正在结束遥操…",
+                    "机器人将缓慢返回安全初始姿态",
+                    "warning",
+                )
+                START = False
+                STOP = True
+
+            # high level locomotion control
             if args.input_mode == "controller" and args.motion and tele_data.motion_data_ready:
-                # quit teleoperate
-                if tele_data.right_ctrl_aButton:
-                    tv_wrapper.set_hud_status(
-                        "正在结束遥操…",
-                        "机器人将返回安全初始姿态",
-                        "warning",
-                    )
-                    START = False
-                    STOP = True
                 # command robot to enter damping mode. soft emergency stop function
                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
                     damp_code = loco_wrapper.Damp()
@@ -1489,6 +1610,7 @@ if __name__ == '__main__':
                         h2_locked_targets,
                         args.exit_arm_pose_duration,
                         respect_stop=False,
+                        gravity_torques=arm_ik.gravity_torques,
                     )
                 else:
                     logger_mp.warning("Skip H2 ctrl_dual_arm_go_home because no init pose file is available.")
