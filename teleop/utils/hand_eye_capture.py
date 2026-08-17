@@ -14,6 +14,7 @@ SETTLING = "SETTLING"
 CAPTURING = "CAPTURING"
 SAVING = "SAVING"
 HOLD = "HOLD"
+RESUMING = "RESUMING"
 
 
 def build_hand_eye_hud_status(
@@ -45,6 +46,8 @@ def build_hand_eye_hud_status(
         return f"RGB-D 采集中 {captured} / {burst}", "请等待采集完成", "warning"
     if state == SAVING:
         return "数据保存中…", "请勿退出，等待写盘完成", "warning"
+    if state == RESUMING:
+        return "正在追赶手柄位置…", "机械臂平滑移动中，请保持手柄稳定", "warning"
     if state == HOLD:
         return f"第 {saved} 条已保存", "B：恢复绝对位姿跟随　A：结束", "success"
     if not motion_ready:
@@ -179,7 +182,7 @@ class HandEyeCaptureState:
         """Latch a fatal HOLD error if measured joints leave the commanded hold pose."""
         q = np.asarray(current_q, dtype=float)
         with self._lock:
-            if self._state == FOLLOW or self._hold_q is None:
+            if self._state in {FOLLOW, RESUMING} or self._hold_q is None:
                 return False
             if self._fatal_error:
                 return False
@@ -318,6 +321,19 @@ class HandEyeCaptureState:
         with self._lock:
             if self._state != HOLD:
                 raise RuntimeError(f"cannot resume from {self._state}")
+            self._resume_follow()
+
+    def begin_resume(self) -> None:
+        with self._lock:
+            if self._state != HOLD:
+                raise RuntimeError(f"cannot begin resume from {self._state}")
+            self._state = RESUMING
+            self._error = None
+
+    def finish_resume(self) -> None:
+        with self._lock:
+            if self._state != RESUMING:
+                raise RuntimeError(f"cannot finish resume from {self._state}")
             self._resume_follow()
 
     def _resume_follow(self) -> None:

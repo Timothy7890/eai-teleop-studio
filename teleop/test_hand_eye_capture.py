@@ -10,6 +10,7 @@ from teleop.utils.hand_eye_capture import (
     CAPTURING,
     FOLLOW,
     HOLD,
+    RESUMING,
     SAVING,
     HandEyeCaptureState,
     build_hand_eye_hud_status,
@@ -114,6 +115,16 @@ class HandEyeCaptureStateTest(unittest.TestCase):
         np.testing.assert_allclose(first_left, left_robot)
         np.testing.assert_allclose(first_right, right_robot)
 
+    def test_smooth_resume_state_ignores_intentional_hold_departure(self):
+        state = HandEyeCaptureState(max_hold_error=0.05)
+        state.begin_hold(np.zeros(14), now=0.0)
+        state.fail("sample ready")
+        state.begin_resume()
+        self.assertEqual(state.state, RESUMING)
+        self.assertFalse(state.check_hold_drift(np.ones(14)))
+        state.finish_resume()
+        self.assertEqual(state.state, FOLLOW)
+
     def test_hud_status_tracks_capture_lifecycle(self):
         waiting = build_hand_eye_hud_status({}, started=False)
         self.assertEqual(waiting[0], "等待开始遥操")
@@ -158,6 +169,15 @@ class HandEyeCaptureStateTest(unittest.TestCase):
         )
         self.assertIn("第 3 条已保存", hold[0])
         self.assertIn("恢复绝对位姿跟随", hold[1])
+
+        resuming = build_hand_eye_hud_status(
+            {
+                "HAND_EYE_STATE": RESUMING,
+                "HAND_EYE_FOLLOW_ENABLED": True,
+            },
+            started=True,
+        )
+        self.assertIn("追赶手柄位置", resuming[0])
 
 
 class HandEyeRecorderTest(unittest.TestCase):

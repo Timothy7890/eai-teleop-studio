@@ -46,6 +46,7 @@ from teleop.utils.hand_eye_capture import (
     CAPTURING as HAND_EYE_CAPTURING,
     FOLLOW as HAND_EYE_FOLLOW,
     HOLD as HAND_EYE_HOLD,
+    RESUMING as HAND_EYE_RESUMING,
     SAVING as HAND_EYE_SAVING,
     SETTLING as HAND_EYE_SETTLING,
     HandEyeCaptureState,
@@ -526,6 +527,8 @@ if __name__ == '__main__':
                         help='Maximum right-arm joint position span in rad over the settling window.')
     parser.add_argument('--hand-eye-max-hold-error', type=float, default=0.05,
                         help='Maximum measured right-arm hold drift in rad before capture is blocked.')
+    parser.add_argument('--hand-eye-resume-seconds', type=float, default=2.0,
+                        help='Seconds used to move smoothly to the current absolute XR target after saving.')
     parser.add_argument('--hand-eye-burst-frames', type=int, default=5,
                         help='Number of unique RGB-D frames saved per hand-eye sample.')
     parser.add_argument('--hand-eye-replay', type=str, default='',
@@ -614,6 +617,7 @@ if __name__ == '__main__':
     init_arm_q = None
     init_locked_joint_targets = {}
     hand_eye_start_q = None
+    hand_eye_resume_transition = None
     ik_replay_pusher = None
     recorder = None
     hand_eye_recorder = None
@@ -1175,24 +1179,20 @@ if __name__ == '__main__':
                                 )
                                 resume_q[:7] = left_fixed_q
                                 resume_delta = float(np.max(np.abs(resume_q - hold_q)))
-                                if resume_delta > 0.02:
-                                    arm_ik.reset_solution(hold_q)
-                                    HAND_EYE_CAPTURE.fail(
-                                        f"Absolute resume rejected: first IK delta "
-                                        f"{resume_delta:.5f} rad exceeds 0.02 rad."
-                                    )
-                                else:
-                                    HAND_EYE_CAPTURE.resume_without_rebase()
-                                    if trajectory_recorder is not None:
-                                        last_frame_index = trajectory_recorder.last_frame_index
-                                        next_frame_index = (
-                                            -1 if last_frame_index is None else last_frame_index
-                                        ) + 1
-                                        trajectory_recorder.finish_capture_event(next_frame_index)
-                                    logger_mp.info(
-                                        "Hand-eye capture: absolute XR-to-IK follow resumed; "
-                                        f"first IK delta={resume_delta:.5f} rad."
-                                    )
+                                if not np.all(np.isfinite(resume_q)):
+                                    raise RuntimeError("absolute resume IK returned non-finite joints")
+                                hand_eye_resume_transition = {
+                                    "start_q": current_lr_arm_q.copy(),
+                                    "target_q": resume_q.copy(),
+                                    "start_time": time.monotonic(),
+                                    "duration": max(args.hand_eye_resume_seconds, 0.1),
+                                }
+                                HAND_EYE_CAPTURE.begin_resume()
+                                logger_mp.info(
+                                    "Hand-eye capture: smooth absolute resume started; "
+                                    f"joint_delta={resume_delta:.5f} rad, "
+                                    f"duration={hand_eye_resume_transition['duration']:.2f}s."
+                                )
                             except Exception as exc:
                                 HAND_EYE_CAPTURE.fail(f"Absolute resume failed: {exc}")
                                 if trajectory_recorder is not None:
@@ -1377,7 +1377,40 @@ if __name__ == '__main__':
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
-            if (
+            if hand_eye_resume_transition is not None:
+                if HAND_EYE_CAPTURE.state != HAND_EYE_RESUMING:
+                    raise RuntimeError(
+                        "hand-eye resume transition exists outside RESUMING state"
+                    )
+                elapsed = (
+                    time.monotonic()
+                    - hand_eye_resume_transition["start_time"]
+                )
+                progress = min(
+                    1.0,
+                    elapsed / hand_eye_resume_transition["duration"],
+                )
+                alpha = smoothstep_progress(progress)
+                transition_start_q = hand_eye_resume_transition["start_q"]
+                transition_target_q = hand_eye_resume_transition["target_q"]
+                sol_q = transition_start_q + (
+                    transition_target_q - transition_start_q
+                ) * alpha
+                sol_tauff = arm_ik.gravity_torques(sol_q)
+                if progress >= 1.0:
+                    arm_ik.reset_solution(transition_target_q)
+                    HAND_EYE_CAPTURE.finish_resume()
+                    if trajectory_recorder is not None:
+                        last_frame_index = trajectory_recorder.last_frame_index
+                        next_frame_index = (
+                            -1 if last_frame_index is None else last_frame_index
+                        ) + 1
+                        trajectory_recorder.finish_capture_event(next_frame_index)
+                    hand_eye_resume_transition = None
+                    logger_mp.info(
+                        "Hand-eye capture: smooth absolute resume completed."
+                    )
+            elif (
                 args.hand_eye_record
                 and HAND_EYE_REPLAY is None
                 and not HAND_EYE_CAPTURE.follow_enabled
