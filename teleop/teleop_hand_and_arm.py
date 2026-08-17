@@ -517,7 +517,7 @@ if __name__ == '__main__':
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--hand-eye-record', action='store_true',
-                        help='Enable sparse hand-eye RGB-D capture with hold and XR rebase.')
+                        help='Enable sparse hand-eye RGB-D capture with absolute XR-to-IK following.')
     parser.add_argument('--hand-eye-settle-seconds', type=float, default=0.5,
                         help='Required stable time before a hand-eye burst is captured.')
     parser.add_argument('--hand-eye-max-joint-speed', type=float, default=0.02,
@@ -613,7 +613,7 @@ if __name__ == '__main__':
     motion_switcher = None
     init_arm_q = None
     init_locked_joint_targets = {}
-    initial_hand_eye_rebase_pending = False
+    hand_eye_start_q = None
     ik_replay_pusher = None
     recorder = None
     hand_eye_recorder = None
@@ -794,20 +794,22 @@ if __name__ == '__main__':
             if init_arm_q.shape[0] != current_dim:
                 raise ValueError(f"Init arm pose dim {init_arm_q.shape[0]} does not match current arm dim {current_dim}")
             if args.arm == "H2":
+                h2_locked_targets = {} if args.motion else init_locked_joint_targets
+                startup_duration = args.init_arm_pose_duration
                 if args.hand_eye_record and HAND_EYE_REPLAY is None:
-                    logger_mp.info(
-                        "Hand-eye capture keeps the measured startup arm pose; "
-                        "the configured init pose is reserved for smooth safe exit."
+                    startup_duration = max(startup_duration, 5.0)
+                    tv_wrapper.set_hud_status(
+                        "正在进入固定初始姿态…",
+                        "手柄运动暂不参与控制，请等待到位",
+                        "warning",
                     )
-                else:
-                    h2_locked_targets = {} if args.motion else init_locked_joint_targets
-                    move_h2_to_pose(
-                        arm_ctrl,
-                        init_arm_q,
-                        h2_locked_targets,
-                        args.init_arm_pose_duration,
-                        gravity_torques=arm_ik.gravity_torques,
-                    )
+                move_h2_to_pose(
+                    arm_ctrl,
+                    init_arm_q,
+                    h2_locked_targets,
+                    startup_duration,
+                    gravity_torques=arm_ik.gravity_torques,
+                )
             else:
                 move_dual_arm_to_pose(arm_ctrl, init_arm_q, args.init_arm_pose_duration)
 
@@ -840,7 +842,12 @@ if __name__ == '__main__':
             left_fixed_wrist_pose, _ = arm_ik.forward_wrist_poses(
                 np.concatenate([left_fixed_q, current_arm_q[-7:]])
             )
-            initial_hand_eye_rebase_pending = HAND_EYE_REPLAY is None
+            hand_eye_start_q = np.concatenate([
+                left_fixed_q,
+                current_arm_q[-7:],
+            ])
+            if HAND_EYE_REPLAY is not None:
+                HAND_EYE_CAPTURE.enable_follow()
 
         # end-effector
         xr_motion_data_ready = Value('b', False, lock=True)        # [input] whether XR hand/controller motion data has arrived
@@ -957,7 +964,10 @@ if __name__ == '__main__':
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press controller [A], Web start, or [r] to begin teleoperation.")
         if args.hand_eye_record:
-            logger_mp.info("🟠  Press controller [B] or use the Web button to hold/capture, then press again to rebase.")
+            logger_mp.info(
+                "🟠  First controller [B] enables following; later [B] presses "
+                "hold/capture and resume absolute following."
+            )
         elif args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
         else:
@@ -1004,6 +1014,11 @@ if __name__ == '__main__':
             and tele_data.motion_data_ready
             and tele_data.right_ctrl_aButton
         )
+        if args.hand_eye_record and args.input_mode == "controller":
+            HAND_EYE_CAPTURE.observe_button(
+                bool(tele_data.motion_data_ready and tele_data.right_ctrl_bButton)
+            )
+            HAND_EYE_CAPTURE.consume_toggle()
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         update_vr_hud(tv_wrapper, started=True, motion_ready=False)
         arm_ctrl.speed_gradual_max()
@@ -1093,26 +1108,6 @@ if __name__ == '__main__':
             hand_eye_holding = False
             if args.hand_eye_record:
                 replay_mode = HAND_EYE_REPLAY is not None
-                if initial_hand_eye_rebase_pending and tele_data.motion_data_ready:
-                    initial_anchor_q = np.concatenate([
-                        left_fixed_q,
-                        current_lr_arm_q[-7:],
-                    ])
-                    left_robot, right_robot = arm_ik.forward_wrist_poses(
-                        initial_anchor_q
-                    )
-                    HAND_EYE_CAPTURE.initialize_rebase(
-                        tele_data.left_wrist_pose,
-                        tele_data.right_wrist_pose,
-                        left_robot,
-                        right_robot,
-                    )
-                    arm_ik.reset_solution(initial_anchor_q)
-                    initial_hand_eye_rebase_pending = False
-                    logger_mp.info(
-                        "Hand-eye initial XR anchor set from the current measured "
-                        "right-arm pose."
-                    )
                 if replay_mode and HAND_EYE_REPLAY.state == HAND_EYE_REPLAY.WAITING:
                     HAND_EYE_REPLAY.start(current_lr_arm_q)
                     logger_mp.info("Hand-eye deterministic replay started.")
@@ -1128,8 +1123,30 @@ if __name__ == '__main__':
                     )
 
                 if not replay_mode and args.input_mode == "controller":
-                    HAND_EYE_CAPTURE.observe_button(tele_data.right_ctrl_bButton)
-                if not replay_mode and HAND_EYE_CAPTURE.consume_toggle():
+                    b_button_fired = HAND_EYE_CAPTURE.observe_button(
+                        tele_data.right_ctrl_bButton
+                    )
+                    if b_button_fired and not HAND_EYE_CAPTURE.follow_enabled:
+                        HAND_EYE_CAPTURE.consume_toggle()
+                        if not tele_data.motion_data_ready:
+                            logger_mp.warning(
+                                "Initial follow request ignored: XR motion data is not ready."
+                            )
+                        else:
+                            initial_solution_q = np.concatenate([
+                                left_fixed_q,
+                                current_lr_arm_q[-7:],
+                            ])
+                            arm_ik.reset_solution(initial_solution_q)
+                            HAND_EYE_CAPTURE.enable_follow()
+                            logger_mp.info(
+                                "Hand-eye absolute XR-to-IK follow enabled by first B press."
+                            )
+                if (
+                    not replay_mode
+                    and HAND_EYE_CAPTURE.follow_enabled
+                    and HAND_EYE_CAPTURE.consume_toggle()
+                ):
                     if HAND_EYE_CAPTURE.state == HAND_EYE_FOLLOW:
                         hold_q = np.concatenate([left_fixed_q, current_lr_arm_q[-7:]])
                         HAND_EYE_CAPTURE.begin_hold(hold_q)
@@ -1139,7 +1156,7 @@ if __name__ == '__main__':
                     elif HAND_EYE_CAPTURE.state == HAND_EYE_HOLD:
                         if HAND_EYE_CAPTURE.fatal_error:
                             logger_mp.error(
-                                "Hand-eye rebase blocked after fatal hold safety error; "
+                                "Hand-eye absolute resume blocked after fatal hold safety error; "
                                 "stop teleoperation."
                             )
                         elif not tele_data.motion_data_ready:
@@ -1147,18 +1164,8 @@ if __name__ == '__main__':
                         else:
                             try:
                                 hold_q = HAND_EYE_CAPTURE.hold_q
-                                left_robot, right_robot = arm_ik.forward_wrist_poses(hold_q)
-                                anchors = HAND_EYE_CAPTURE.preview_rebase(
-                                    tele_data.left_wrist_pose,
-                                    tele_data.right_wrist_pose,
-                                    left_robot,
-                                    right_robot,
-                                )
-                                left_target, right_target = anchors.apply(
-                                    tele_data.left_wrist_pose,
-                                    tele_data.right_wrist_pose,
-                                )
                                 left_target = left_fixed_wrist_pose
+                                right_target = tele_data.right_wrist_pose
                                 arm_ik.reset_solution(hold_q)
                                 resume_q, _ = arm_ik.solve_ik(
                                     left_target,
@@ -1171,10 +1178,11 @@ if __name__ == '__main__':
                                 if resume_delta > 0.02:
                                     arm_ik.reset_solution(hold_q)
                                     HAND_EYE_CAPTURE.fail(
-                                        f"Rebase rejected: first IK delta {resume_delta:.5f} rad exceeds 0.02 rad."
+                                        f"Absolute resume rejected: first IK delta "
+                                        f"{resume_delta:.5f} rad exceeds 0.02 rad."
                                     )
                                 else:
-                                    HAND_EYE_CAPTURE.commit_rebase(anchors)
+                                    HAND_EYE_CAPTURE.resume_without_rebase()
                                     if trajectory_recorder is not None:
                                         last_frame_index = trajectory_recorder.last_frame_index
                                         next_frame_index = (
@@ -1182,13 +1190,14 @@ if __name__ == '__main__':
                                         ) + 1
                                         trajectory_recorder.finish_capture_event(next_frame_index)
                                     logger_mp.info(
-                                        f"Hand-eye capture: XR rebase committed; first IK delta={resume_delta:.5f} rad."
+                                        "Hand-eye capture: absolute XR-to-IK follow resumed; "
+                                        f"first IK delta={resume_delta:.5f} rad."
                                     )
                             except Exception as exc:
-                                HAND_EYE_CAPTURE.fail(f"Rebase failed: {exc}")
+                                HAND_EYE_CAPTURE.fail(f"Absolute resume failed: {exc}")
                                 if trajectory_recorder is not None:
                                     trajectory_recorder.mark_capture_error(str(exc))
-                                logger_mp.error(f"Hand-eye rebase failed: {exc}")
+                                logger_mp.error(f"Hand-eye absolute resume failed: {exc}")
                     else:
                         logger_mp.warning(
                             f"Hand-eye toggle ignored while state={HAND_EYE_CAPTURE.state}."
@@ -1289,7 +1298,13 @@ if __name__ == '__main__':
                     HAND_EYE_CAPTURING,
                     HAND_EYE_SAVING,
                 }
-                READY = HAND_EYE_CAPTURE.state in {HAND_EYE_FOLLOW, HAND_EYE_HOLD}
+                READY = (
+                    HAND_EYE_CAPTURE.follow_enabled
+                    and HAND_EYE_CAPTURE.state in {
+                        HAND_EYE_FOLLOW,
+                        HAND_EYE_HOLD,
+                    }
+                )
 
             update_vr_hud(
                 tv_wrapper,
@@ -1362,7 +1377,14 @@ if __name__ == '__main__':
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
-            if hand_eye_holding:
+            if (
+                args.hand_eye_record
+                and HAND_EYE_REPLAY is None
+                and not HAND_EYE_CAPTURE.follow_enabled
+            ):
+                sol_q = hand_eye_start_q.copy()
+                sol_tauff = arm_ik.gravity_torques(sol_q)
+            elif hand_eye_holding:
                 sol_q = HAND_EYE_CAPTURE.hold_q
                 sol_tauff = np.zeros_like(sol_q)
             elif HAND_EYE_REPLAY is not None:
@@ -1384,10 +1406,6 @@ if __name__ == '__main__':
                 left_wrist_target = tele_data.left_wrist_pose
                 right_wrist_target = tele_data.right_wrist_pose
                 if args.hand_eye_record:
-                    _, right_wrist_target = HAND_EYE_CAPTURE.apply_rebase(
-                        left_wrist_target,
-                        right_wrist_target,
-                    )
                     left_wrist_target = left_fixed_wrist_pose
                 sol_q, sol_tauff = arm_ik.solve_ik(
                     left_wrist_target,

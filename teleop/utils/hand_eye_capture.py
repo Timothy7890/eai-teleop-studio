@@ -27,6 +27,7 @@ def build_hand_eye_hud_status(
         return "等待开始遥操", "确认追踪后按 A，或在电脑点击“开始遥操”", "info"
 
     state = snapshot.get("HAND_EYE_STATE", FOLLOW)
+    follow_enabled = bool(snapshot.get("HAND_EYE_FOLLOW_ENABLED", True))
     saved = int(snapshot.get("HAND_EYE_SAVED_SAMPLES", 0) or 0)
     captured = int(snapshot.get("HAND_EYE_CAPTURED_FRAMES", 0) or 0)
     burst = int(snapshot.get("HAND_EYE_BURST_FRAMES", 1) or 1)
@@ -34,6 +35,10 @@ def build_hand_eye_hud_status(
 
     if error:
         return "采集错误 · 机器人保持中", str(error)[:80], "error"
+    if not follow_enabled:
+        if not motion_ready:
+            return "等待右手柄追踪", "确认控制器权限和手柄连接", "warning"
+        return "固定姿态已就绪", "B：开始绝对位姿跟随　A：结束", "info"
     if state == SETTLING:
         return "关节判稳中…", "机器人已锁定，请等待", "warning"
     if state == CAPTURING:
@@ -41,7 +46,7 @@ def build_hand_eye_hud_status(
     if state == SAVING:
         return "数据保存中…", "请勿退出，等待写盘完成", "warning"
     if state == HOLD:
-        return f"第 {saved} 条已保存", "B：重新对齐并恢复遥操　A：结束", "success"
+        return f"第 {saved} 条已保存", "B：恢复绝对位姿跟随　A：结束", "success"
     if not motion_ready:
         return "等待右手柄追踪", "确认 VR 控制器权限和手柄连接", "warning"
     return f"遥操中 · 已保存 {saved} 条", "B：锁定并采样　A：结束遥操", "success"
@@ -103,6 +108,7 @@ class HandEyeCaptureState:
         self._last_sample: Optional[str] = None
         self._error: Optional[str] = None
         self._fatal_error = False
+        self._follow_enabled = False
 
     @property
     def state(self) -> str:
@@ -122,6 +128,17 @@ class HandEyeCaptureState:
     def fatal_error(self) -> bool:
         with self._lock:
             return self._fatal_error
+
+    @property
+    def follow_enabled(self) -> bool:
+        with self._lock:
+            return self._follow_enabled
+
+    def enable_follow(self) -> None:
+        with self._lock:
+            if self._state != FOLLOW:
+                raise RuntimeError(f"cannot enable follow from {self._state}")
+            self._follow_enabled = True
 
     def observe_button(self, pressed: bool) -> bool:
         """Queue one toggle on a rising edge and return whether it fired."""
@@ -326,4 +343,5 @@ class HandEyeCaptureState:
                 "HAND_EYE_LAST_SAMPLE": self._last_sample,
                 "HAND_EYE_ERROR": self._error,
                 "HAND_EYE_FATAL_ERROR": self._fatal_error,
+                "HAND_EYE_FOLLOW_ENABLED": self._follow_enabled,
             }

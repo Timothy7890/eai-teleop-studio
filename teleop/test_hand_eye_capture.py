@@ -88,11 +88,14 @@ class HandEyeCaptureStateTest(unittest.TestCase):
 
     def test_initial_rebase_starts_from_current_robot_pose(self):
         state = HandEyeCaptureState()
+        self.assertFalse(state.follow_enabled)
         left_xr = pose(1.0, 2.0, 3.0)
         right_xr = pose(-1.0, 2.0, 3.0)
         left_robot = pose(0.2, 0.3, 0.4)
         right_robot = pose(0.2, -0.3, 0.4)
         state.initialize_rebase(left_xr, right_xr, left_robot, right_robot)
+        state.enable_follow()
+        self.assertTrue(state.follow_enabled)
         first_left, first_right = state.apply_rebase(left_xr, right_xr)
         np.testing.assert_allclose(first_left, left_robot)
         np.testing.assert_allclose(first_right, right_robot)
@@ -101,6 +104,16 @@ class HandEyeCaptureStateTest(unittest.TestCase):
         waiting = build_hand_eye_hud_status({}, started=False)
         self.assertEqual(waiting[0], "等待开始遥操")
         self.assertIn("按 A", waiting[1])
+
+        waiting_follow = build_hand_eye_hud_status(
+            {
+                "HAND_EYE_STATE": FOLLOW,
+                "HAND_EYE_FOLLOW_ENABLED": False,
+            },
+            started=True,
+        )
+        self.assertEqual(waiting_follow[0], "固定姿态已就绪")
+        self.assertIn("B：开始绝对位姿跟随", waiting_follow[1])
 
         following = build_hand_eye_hud_status(
             {
@@ -130,7 +143,7 @@ class HandEyeCaptureStateTest(unittest.TestCase):
             started=True,
         )
         self.assertIn("第 3 条已保存", hold[0])
-        self.assertIn("重新对齐", hold[1])
+        self.assertIn("恢复绝对位姿跟随", hold[1])
 
 
 class HandEyeRecorderTest(unittest.TestCase):
