@@ -41,7 +41,17 @@ def build_hand_eye_hud_status(
             return "等待右手柄追踪", "确认控制器权限和手柄连接", "warning"
         return "固定姿态已就绪", "B：开始绝对位姿跟随　A：结束", "info"
     if state == SETTLING:
-        return "关节判稳中…", "机器人已锁定，请等待", "warning"
+        progress = float(snapshot.get("HAND_EYE_SETTLING_PROGRESS", 0.0) or 0.0)
+        speed = float(snapshot.get("HAND_EYE_SETTLING_WINDOW_SPEED", 0.0) or 0.0)
+        span = float(snapshot.get("HAND_EYE_SETTLING_WINDOW_SPAN", 0.0) or 0.0)
+        speed_limit = float(snapshot.get("HAND_EYE_MAX_JOINT_SPEED", 0.0) or 0.0)
+        span_limit = float(snapshot.get("HAND_EYE_MAX_JOINT_SPAN", 0.0) or 0.0)
+        return (
+            f"关节判稳中… {progress * 100:.0f}%",
+            f"编码器窗口速度 {speed:.4f}/{speed_limit:.4f} · "
+            f"波动 {span:.4f}/{span_limit:.4f} rad",
+            "warning",
+        )
     if state == CAPTURING:
         return f"RGB-D 采集中 {captured} / {burst}", "请等待采集完成", "warning"
     if state == SAVING:
@@ -112,6 +122,11 @@ class HandEyeCaptureState:
         self._error: Optional[str] = None
         self._fatal_error = False
         self._follow_enabled = False
+        self._settling_window_speed = 0.0
+        self._settling_window_span = 0.0
+        self._settling_raw_dq = 0.0
+        self._settling_progress = 0.0
+        self._settling_blocker = "collecting_window"
 
     @property
     def state(self) -> str:
@@ -176,7 +191,11 @@ class HandEyeCaptureState:
             self._captured_frames = 0
             self._error = None
             self._fatal_error = False
-            self._append_q(now if now is not None else time.monotonic(), q)
+            self._settling_window_speed = 0.0
+            self._settling_window_span = 0.0
+            self._settling_raw_dq = 0.0
+            self._settling_progress = 0.0
+            self._settling_blocker = "collecting_window"
 
     def check_hold_drift(self, current_q: np.ndarray) -> bool:
         """Latch a fatal HOLD error if measured joints leave the commanded hold pose."""
@@ -216,36 +235,62 @@ class HandEyeCaptureState:
         current_dq: np.ndarray,
         now: Optional[float] = None,
     ) -> bool:
-        """Return True exactly when the state advances to CAPTURING."""
+        """Advance after a stable measured-position window.
+
+        H2 ``motor_state.dq`` occasionally contains isolated spikes while the
+        encoder position is stationary.  Using every raw dq sample as a hard
+        gate can therefore reset settling forever.  The capture gate derives
+        speed from the right-arm encoder positions across the full window and
+        also checks their peak-to-peak span.  ``current_dq`` is retained only
+        for diagnostics and API compatibility.
+        """
         q = np.asarray(current_q, dtype=float)
         dq = np.asarray(current_dq, dtype=float)
         now = time.monotonic() if now is None else float(now)
         with self._lock:
             if self._state != SETTLING:
                 return False
-            speed_ok = (
-                q.shape == (14,)
-                and dq.shape == (14,)
-                and float(np.max(np.abs(dq[-7:]))) <= self.max_joint_speed
-            )
-            if not speed_ok:
+            if q.shape != (14,) or not np.all(np.isfinite(q)):
                 self._stable_since = None
                 self._q_history.clear()
+                self._settling_progress = 0.0
+                self._settling_blocker = "invalid_position"
                 return False
+            self._settling_raw_dq = (
+                float(np.max(np.abs(dq[-7:])))
+                if dq.shape == (14,) and np.all(np.isfinite(dq))
+                else float("nan")
+            )
             if self._stable_since is None:
                 self._stable_since = now
             self._append_q(now, q)
-            if now - self._stable_since + 1e-9 < self.settle_seconds or len(self._q_history) < 2:
+            elapsed = now - self._stable_since
+            self._settling_progress = min(1.0, max(0.0, elapsed / self.settle_seconds))
+            if elapsed + 1e-9 < self.settle_seconds or len(self._q_history) < 2:
+                self._settling_blocker = "collecting_window"
                 return False
+            times = np.asarray([item[0] for item in self._q_history], dtype=float)
             q_values = np.stack([item[1] for item in self._q_history])
+            window_seconds = max(float(times[-1] - times[0]), 1e-9)
+            speed = float(
+                np.max(np.abs(q_values[-1, -7:] - q_values[0, -7:]))
+                / window_seconds
+            )
             span = float(np.max(np.ptp(q_values[:, -7:], axis=0)))
-            if span > self.max_joint_span:
+            self._settling_window_speed = speed
+            self._settling_window_span = span
+            if speed > self.max_joint_speed or span > self.max_joint_span:
                 self._stable_since = now
                 self._q_history.clear()
                 self._append_q(now, q)
+                self._settling_progress = 0.0
+                self._settling_blocker = (
+                    "window_speed" if speed > self.max_joint_speed else "window_span"
+                )
                 return False
             self._state = CAPTURING
             self._captured_frames = 0
+            self._settling_blocker = None
             return True
 
     def set_capture_progress(self, captured_frames: int) -> None:
@@ -345,6 +390,11 @@ class HandEyeCaptureState:
         self._captured_frames = 0
         self._error = None
         self._fatal_error = False
+        self._settling_window_speed = 0.0
+        self._settling_window_span = 0.0
+        self._settling_raw_dq = 0.0
+        self._settling_progress = 0.0
+        self._settling_blocker = None
 
     def apply_rebase(self, left_xr: np.ndarray, right_xr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         with self._lock:
@@ -364,4 +414,11 @@ class HandEyeCaptureState:
                 "HAND_EYE_ERROR": self._error,
                 "HAND_EYE_FATAL_ERROR": self._fatal_error,
                 "HAND_EYE_FOLLOW_ENABLED": self._follow_enabled,
+                "HAND_EYE_SETTLING_WINDOW_SPEED": self._settling_window_speed,
+                "HAND_EYE_SETTLING_WINDOW_SPAN": self._settling_window_span,
+                "HAND_EYE_SETTLING_RAW_DQ": self._settling_raw_dq,
+                "HAND_EYE_SETTLING_PROGRESS": self._settling_progress,
+                "HAND_EYE_SETTLING_BLOCKER": self._settling_blocker,
+                "HAND_EYE_MAX_JOINT_SPEED": self.max_joint_speed,
+                "HAND_EYE_MAX_JOINT_SPAN": self.max_joint_span,
             }

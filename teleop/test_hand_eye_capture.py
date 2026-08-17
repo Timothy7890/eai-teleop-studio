@@ -39,18 +39,39 @@ class HandEyeCaptureStateTest(unittest.TestCase):
         self.assertTrue(state.observe_button(True))
         self.assertTrue(state.consume_toggle())
 
-    def test_settling_requires_time_speed_and_span(self):
+    def test_settling_uses_measured_position_window(self):
         state = HandEyeCaptureState(
             settle_seconds=0.5,
             max_joint_speed=0.02,
+            max_joint_span=1.0,
+        )
+        q = np.zeros(14)
+        state.begin_hold(q, now=0.0)
+        self.assertFalse(state.update_settling(q, np.zeros(14), now=0.1))
+        moving_q = q.copy()
+        moving_q[-1] = 0.02
+        self.assertFalse(state.update_settling(moving_q, np.zeros(14), now=0.6))
+        snapshot = state.snapshot()
+        self.assertGreater(snapshot["HAND_EYE_SETTLING_WINDOW_SPEED"], 0.02)
+        self.assertEqual(snapshot["HAND_EYE_SETTLING_BLOCKER"], "window_speed")
+        self.assertFalse(state.update_settling(moving_q, np.zeros(14), now=0.7))
+        self.assertTrue(state.update_settling(moving_q, np.zeros(14), now=1.2))
+        self.assertEqual(state.state, CAPTURING)
+
+    def test_raw_dq_spikes_do_not_block_stationary_encoder_window(self):
+        state = HandEyeCaptureState(
+            settle_seconds=0.5,
+            max_joint_speed=0.05,
             max_joint_span=0.003,
         )
         q = np.zeros(14)
         state.begin_hold(q, now=0.0)
-        self.assertFalse(state.update_settling(q, np.ones(14) * 0.03, now=0.1))
-        self.assertFalse(state.update_settling(q, np.zeros(14), now=0.2))
-        self.assertTrue(state.update_settling(q, np.zeros(14), now=0.7))
-        self.assertEqual(state.state, CAPTURING)
+        noisy_dq = np.ones(14) * 2.0
+        self.assertFalse(state.update_settling(q, noisy_dq, now=0.1))
+        self.assertTrue(state.update_settling(q, noisy_dq, now=0.6))
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot["HAND_EYE_SETTLING_RAW_DQ"], 2.0)
+        self.assertEqual(snapshot["HAND_EYE_SETTLING_WINDOW_SPEED"], 0.0)
 
     def test_hold_drift_is_fatal_and_blocks_capture(self):
         state = HandEyeCaptureState(max_hold_error=0.05)
