@@ -130,11 +130,15 @@ class HandEyeTrajectoryRecorder:
 
     def finish_capture_event(self, frame_index: Optional[int] = None) -> None:
         if self._open_event is None:
-            raise RuntimeError("no open trajectory capture event")
+            return
         index = self.last_frame_index if frame_index is None else int(frame_index)
         self._open_event["resume_frame_index"] = index
         self._open_event = None
         self._flush_events()
+
+    @property
+    def has_open_event(self) -> bool:
+        return self._open_event is not None
 
     def _events_payload(self, *, completed: bool) -> dict[str, Any]:
         return {

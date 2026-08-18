@@ -10,6 +10,7 @@ import threading
 import cv2
 import os
 import time
+from urllib.parse import urlencode
 from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 from typing import Literal, Tuple
@@ -68,6 +69,33 @@ def _install_asset_cache(app, client_root: Path) -> None:
         return web.Response(body=body, content_type=content_type, headers=headers)
 
     app.middlewares.append(asset_cache_middleware)
+
+
+def _install_ws_query_redirect(app) -> None:
+    """Redirect `/` to `/?ws=wss://<host>` when the query is missing.
+
+    The Vuer client does not infer the control WebSocket from the page origin.
+    Opening https://host:8012 without `?ws=wss://host:8012` connects to the
+    client's default endpoint, then drops. The headset must use the same form
+    as the working 8012 bookmark.
+    """
+
+    @web.middleware
+    async def ws_query_redirect(request, handler):
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            return await handler(request)
+        if (
+            request.method == "GET"
+            and request.path in ("/", "")
+            and "ws" not in request.query
+        ):
+            scheme = "wss" if request.secure else "ws"
+            params = dict(request.query)
+            params["ws"] = f"{scheme}://{request.host}"
+            raise web.HTTPFound(f"{request.path or '/'}?{urlencode(params)}")
+        return await handler(request)
+
+    app.middlewares.insert(0, ws_query_redirect)
 
 
 class TeleVuer:
@@ -149,6 +177,7 @@ class TeleVuer:
                     key_file = key_file or str(current_module_dir / "key.pem")
 
         self.vuer = Vuer(host='0.0.0.0', cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
+        _install_ws_query_redirect(self.vuer.app)
         _install_asset_cache(self.vuer.app, self.vuer.client_root)
         self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
         if self.use_hand_tracking:
@@ -269,6 +298,28 @@ class TeleVuer:
             self._main_event_diagnostics(session),
         )
 
+    def _upsert_xr_input(self, session) -> None:
+        if self.use_hand_tracking:
+            session.upsert(
+                Hands(
+                    stream=True,
+                    key="hands",
+                    hideLeft=True,
+                    hideRight=True,
+                ),
+                to="bgChildren",
+            )
+        else:
+            session.upsert(
+                MotionControllers(
+                    stream=True,
+                    key="motionControllers",
+                    left=True,
+                    right=True,
+                ),
+                to="bgChildren",
+            )
+
     async def _main_event_diagnostics(self, session):
         """Print event counters every 10s to localize dead XR input.
 
@@ -381,33 +432,37 @@ class TeleVuer:
             await asyncio.sleep(0.1)
 
     def set_depth_preview(self, depth: np.ndarray) -> dict:
-        """Colorize one depth frame and show it as a static VR overlay."""
+        """Colorize one depth frame and show it as a static VR overlay.
+
+        Invalid pixels (0 and uint16 sentinel 65535) are excluded. The color
+        scale is clipped to the near working range so a hand a few centimetres
+        in front of a cabinet does not collapse into the same color as the wall.
+        """
         depth_array = np.asarray(depth)
         if depth_array.ndim != 2:
             raise ValueError(f"depth preview requires a 2D array, got {depth_array.shape}")
-        valid_mask = depth_array > 0
-        valid = depth_array[valid_mask]
+        # millimetres; indoor arm work is well inside this window
+        near_mm, far_mm = 400.0, 2500.0
+        valid_mask = (depth_array > 0) & (depth_array < 65535)
+        in_range = valid_mask & (depth_array >= near_mm) & (depth_array <= far_mm)
         normalized = np.zeros(depth_array.shape, dtype=np.uint8)
-        if valid.size:
-            low, high = np.percentile(valid, [2.0, 98.0])
-            if high <= low:
-                low = float(valid.min())
-                high = float(valid.max())
-            if high > low:
-                normalized[valid_mask] = np.clip(
-                    (depth_array[valid_mask].astype(np.float32) - low)
-                    * (255.0 / (high - low)),
-                    0,
-                    255,
-                ).astype(np.uint8)
-            else:
-                normalized[valid_mask] = 255
+        if in_range.any():
+            scaled = (depth_array[in_range].astype(np.float32) - near_mm) * (
+                255.0 / (far_mm - near_mm)
+            )
+            normalized[in_range] = np.clip(scaled, 0, 255).astype(np.uint8)
             preview_bgr = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
-            preview_bgr[~valid_mask] = 0
+        else:
+            preview_bgr = np.zeros((*depth_array.shape, 3), dtype=np.uint8)
+        preview_bgr[~valid_mask] = 0
+        # pixels valid but outside the window: dim gray so they do not look like holes
+        outside = valid_mask & ~in_range
+        preview_bgr[outside] = (40, 40, 40)
+        valid = depth_array[valid_mask]
+        if valid.size:
             depth_min = int(valid.min())
             depth_max = int(valid.max())
         else:
-            preview_bgr = np.zeros((*depth_array.shape, 3), dtype=np.uint8)
             cv2.putText(
                 preview_bgr,
                 "NO VALID DEPTH",
@@ -810,29 +865,9 @@ class TeleVuer:
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_binocular_webrtc(self, session):
-        if self.use_hand_tracking:
-            session.upsert(
-                Hands(
-                    stream=True,
-                    key="hands",
-                    hideLeft=True,
-                    hideRight=True
-                ),
-                to="bgChildren",
-            )
-        else:
-            session.upsert(
-                MotionControllers(
-                    stream=True, 
-                    key="motionControllers",
-                    left=True,
-                    right=True,
-                ),
-                to="bgChildren",
-            )
+        self._upsert_xr_input(session)
 
-        while True:
-            session.upsert(
+        session.upsert(
                 WebRTCStereoVideoPlane(
                     src=self.webrtc_url,
                     iceServer=None,
@@ -844,32 +879,14 @@ class TeleVuer:
                 ),
                 to="bgChildren",
             )
-            await asyncio.sleep(1.0 / self.display_fps)
+        while True:
+            await asyncio.sleep(2.0)
+            self._upsert_xr_input(session)
 
     async def main_image_monocular_webrtc(self, session):
-        if self.use_hand_tracking:
-            session.upsert(
-                Hands(
-                    stream=True,
-                    key="hands",
-                    hideLeft=True,
-                    hideRight=True
-                ),
-                to="bgChildren",
-            )
-        else:
-            session.upsert(
-                MotionControllers(
-                    stream=True, 
-                    key="motionControllers",
-                    left=True,
-                    right=True,
-                ),
-                to="bgChildren",
-            )
+        self._upsert_xr_input(session)
 
-        while True:
-            session.upsert(
+        session.upsert(
                 WebRTCVideoPlane(
                     src=self.webrtc_url,
                     iceServer=None,
@@ -880,7 +897,9 @@ class TeleVuer:
                 ),
                 to="bgChildren",
             )
-            await asyncio.sleep(1.0 / self.display_fps)
+        while True:
+            await asyncio.sleep(2.0)
+            self._upsert_xr_input(session)
 
     ## ego MODE
     async def main_image_binocular_zmq_ego(self, session):
@@ -979,29 +998,9 @@ class TeleVuer:
             await asyncio.sleep(1.0 / self.display_fps)
 
     async def main_image_binocular_webrtc_ego(self, session):
-        if self.use_hand_tracking:
-            session.upsert(
-                Hands(
-                    stream=True,
-                    key="hands",
-                    hideLeft=True,
-                    hideRight=True
-                ),
-                to="bgChildren",
-            )
-        else:
-            session.upsert(
-                MotionControllers(
-                    stream=True, 
-                    key="motionControllers",
-                    left=True,
-                    right=True,
-                ),
-                to="bgChildren",
-            )
+        self._upsert_xr_input(session)
 
-        while True:
-            session.upsert(
+        session.upsert(
                 WebRTCStereoVideoPlane(
                     src=self.webrtc_url,
                     iceServer=None,
@@ -1013,32 +1012,14 @@ class TeleVuer:
                 ),
                 to="bgChildren",
             )
-            await asyncio.sleep(1.0 / self.display_fps)
+        while True:
+            await asyncio.sleep(2.0)
+            self._upsert_xr_input(session)
 
     async def main_image_monocular_webrtc_ego(self, session):
-        if self.use_hand_tracking:
-            session.upsert(
-                Hands(
-                    stream=True,
-                    key="hands",
-                    hideLeft=True,
-                    hideRight=True
-                ),
-                to="bgChildren",
-            )
-        else:
-            session.upsert(
-                MotionControllers(
-                    stream=True, 
-                    key="motionControllers",
-                    left=True,
-                    right=True,
-                ),
-                to="bgChildren",
-            )
+        self._upsert_xr_input(session)
 
-        while True:
-            session.upsert(
+        session.upsert(
                 WebRTCVideoPlane(
                     src=self.webrtc_url,
                     iceServer=None,
@@ -1049,33 +1030,17 @@ class TeleVuer:
                 ),
                 to="bgChildren",
             )
-            await asyncio.sleep(1.0 / self.display_fps)
+        while True:
+            await asyncio.sleep(2.0)
+            self._upsert_xr_input(session)
 
     ## pass-through MODE
     async def main_pass_through(self, session):
-        if self.use_hand_tracking:
-            session.upsert(
-                Hands(
-                    stream=True,
-                    key="hands",
-                    hideLeft=True,
-                    hideRight=True
-                ),
-                to="bgChildren",
-            )
-        else:
-            session.upsert(
-                MotionControllers(
-                    stream=True, 
-                    key="motionControllers",
-                    left=True,
-                    right=True,
-                ),
-                to="bgChildren",
-            )
+        self._upsert_xr_input(session)
 
         while True:
-            await asyncio.sleep(1.0 / self.display_fps)
+            await asyncio.sleep(2.0)
+            self._upsert_xr_input(session)
 
     # ==================== common data ====================
     @property
