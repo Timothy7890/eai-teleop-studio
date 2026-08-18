@@ -25,7 +25,13 @@ def build_hand_eye_hud_status(
 ) -> tuple[str, str, str]:
     """Build a concise Chinese VR HUD message from capture state."""
     if not started:
-        return "等待开始遥操", "确认追踪后按 A，或在电脑点击“开始遥操”", "info"
+        if not motion_ready:
+            return (
+                "未收到手柄数据",
+                "请点击进入VR按钮并允许权限，按任意键唤醒手柄",
+                "warning",
+            )
+        return "手柄已连接 · 等待开始", "按 A 或在电脑点击“开始遥操”", "success"
 
     state = snapshot.get("HAND_EYE_STATE", FOLLOW)
     follow_enabled = bool(snapshot.get("HAND_EYE_FOLLOW_ENABLED", True))

@@ -187,8 +187,14 @@ class HandEyeCaptureStateTest(unittest.TestCase):
 
     def test_hud_status_tracks_capture_lifecycle(self):
         waiting = build_hand_eye_hud_status({}, started=False)
-        self.assertEqual(waiting[0], "等待开始遥操")
+        self.assertEqual(waiting[0], "手柄已连接 · 等待开始")
         self.assertIn("按 A", waiting[1])
+
+        waiting_no_motion = build_hand_eye_hud_status(
+            {}, started=False, motion_ready=False
+        )
+        self.assertEqual(waiting_no_motion[0], "未收到手柄数据")
+        self.assertEqual(waiting_no_motion[2], "warning")
 
         waiting_follow = build_hand_eye_hud_status(
             {

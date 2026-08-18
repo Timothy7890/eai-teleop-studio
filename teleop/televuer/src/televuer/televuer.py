@@ -1,8 +1,11 @@
 from vuer import Vuer
 from vuer.schemas import ImageBackground, Hands, MotionControllers, WebRTCVideoPlane, WebRTCStereoVideoPlane
+from aiohttp import web
 from multiprocessing import Value, Array, Process, shared_memory
 import numpy as np
 import asyncio
+import gzip
+import mimetypes
 import threading
 import cv2
 import os
@@ -10,6 +13,61 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 from typing import Literal, Tuple
+
+
+_GZIP_SUFFIXES = {".js", ".css", ".html", ".json", ".map", ".svg", ".txt", ".wasm"}
+
+
+def _install_asset_cache(app, client_root: Path) -> None:
+    """Serve /assets/* from an in-memory gzip cache with immutable headers.
+
+    The stock vuer/aiohttp path streams multi-MB JS chunks from disk over TLS
+    on every page load. On a flaky headset WiFi link the transfer often dies
+    halfway (aiohttp 'resume_reading' errors) and the page renders black.
+    Asset filenames are content-hashed, so aggressive browser caching is safe:
+    after one successful load the headset never re-downloads them.
+    """
+    assets_root = (Path(client_root) / "assets").resolve()
+    cache: dict = {}
+
+    @web.middleware
+    async def asset_cache_middleware(request, handler):
+        if (
+            request.method != "GET"
+            or not request.path.startswith("/assets/")
+            or "Range" in request.headers
+        ):
+            return await handler(request)
+        entry = cache.get(request.path)
+        if entry is None:
+            relative = request.path[len("/assets/"):]
+            try:
+                file_path = (assets_root / relative).resolve()
+                file_path.relative_to(assets_root)
+            except (ValueError, OSError):
+                return await handler(request)
+            if not file_path.is_file():
+                return await handler(request)
+            body = file_path.read_bytes()
+            content_type = (
+                mimetypes.guess_type(file_path.name)[0]
+                or "application/octet-stream"
+            )
+            gz_body = None
+            if file_path.suffix in _GZIP_SUFFIXES:
+                candidate = gzip.compress(body, 6)
+                if len(candidate) < len(body):
+                    gz_body = candidate
+            entry = (body, gz_body, content_type)
+            cache[request.path] = entry
+        body, gz_body, content_type = entry
+        headers = {"Cache-Control": "public, max-age=31536000, immutable"}
+        if gz_body is not None and "gzip" in request.headers.get("Accept-Encoding", ""):
+            headers["Content-Encoding"] = "gzip"
+            body = gz_body
+        return web.Response(body=body, content_type=content_type, headers=headers)
+
+    app.middlewares.append(asset_cache_middleware)
 
 
 class TeleVuer:
@@ -91,6 +149,7 @@ class TeleVuer:
                     key_file = key_file or str(current_module_dir / "key.pem")
 
         self.vuer = Vuer(host='0.0.0.0', cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
+        _install_asset_cache(self.vuer.app, self.vuer.client_root)
         self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
         if self.use_hand_tracking:
             self.vuer.add_handler("HAND_MOVE")(self.on_hand_move)
@@ -105,6 +164,7 @@ class TeleVuer:
         self._controller_move_error_log_time = 0.0
         self._hand_move_event_count = 0
         self._hand_move_error_log_time = 0.0
+        self._cam_move_event_count = 0
         self._hud_capacity = 2048
         self._hud_text_shared = Array('B', self._hud_capacity, lock=True)
         self._hud_level_shared = Value('i', 0, lock=True)
@@ -206,7 +266,34 @@ class TeleVuer:
             self._scene_fn(session),
             self._main_hud(session),
             self._main_depth_preview(session),
+            self._main_event_diagnostics(session),
         )
+
+    async def _main_event_diagnostics(self, session):
+        """Print event counters every 10s to localize dead XR input.
+
+        camera=0            -> client never entered the XR/3D view at all.
+        camera>0 motion=0   -> in XR but controller/hand data is not streaming
+                               (controllers asleep, permission denied, or the
+                               MotionControllers/Hands component not active).
+        motion>0            -> input pipeline is healthy.
+        """
+        prev_cam = prev_motion = 0
+        while True:
+            await asyncio.sleep(10.0)
+            motion = (
+                self._hand_move_event_count
+                if self.use_hand_tracking
+                else self._controller_move_event_count
+            )
+            cam = self._cam_move_event_count
+            print(
+                "[TeleVuer] events last 10s: "
+                f"camera={cam - prev_cam} (total {cam}), "
+                f"motion={motion - prev_motion} (total {motion})",
+                flush=True,
+            )
+            prev_cam, prev_motion = cam, motion
 
     def set_hud_status(self, title: str, detail: str = "", level: str = "info") -> None:
         level_codes = {"info": 0, "success": 1, "warning": 2, "error": 3}
@@ -450,6 +537,9 @@ class TeleVuer:
 
     async def on_cam_move(self, event, session, fps=60):
         try:
+            self._cam_move_event_count += 1
+            if self._cam_move_event_count == 1:
+                print("[TeleVuer] first CAMERA_MOVE event received.", flush=True)
             with self.head_pose_shared.get_lock():
                 self.head_pose_shared[:] = event.value["camera"]["matrix"]
         except:

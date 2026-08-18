@@ -149,11 +149,18 @@ def update_vr_hud(tv_wrapper, *, started: bool, motion_ready: bool = True) -> No
             motion_ready=motion_ready,
         )
     elif not started:
-        title, detail, level = (
-            "等待开始遥操",
-            "确认追踪后按 A，或在电脑点击“开始遥操”",
-            "info",
-        )
+        if motion_ready:
+            title, detail, level = (
+                "手柄已连接 · 等待开始",
+                "按 A 开始遥操，或在电脑点击“开始遥操”",
+                "success",
+            )
+        else:
+            title, detail, level = (
+                "未收到手柄数据",
+                "请点击进入VR并允许权限，按任意键唤醒手柄",
+                "warning",
+            )
     elif not motion_ready:
         title, detail, level = (
             "等待 VR 追踪",
@@ -997,6 +1004,13 @@ if __name__ == '__main__':
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
             tele_data = tv_wrapper.get_tele_data()
+            # Live controller-link status in the headset: green when motion
+            # data is flowing (A will work), yellow warning when it is not.
+            update_vr_hud(
+                tv_wrapper,
+                started=False,
+                motion_ready=tele_data.motion_data_ready,
+            )
             a_button_pressed = bool(
                 args.input_mode == "controller"
                 and tele_data.motion_data_ready
