@@ -1196,12 +1196,18 @@ if __name__ == '__main__':
                         HAND_EYE_REPLAY.abort(f"RGB-D subscription failed: {exc}")
                         logger_mp.error(f"Hand-eye replay RGB-D subscription failed: {exc}")
 
-                if not replay_mode and args.input_mode == "controller":
-                    b_button_fired = HAND_EYE_CAPTURE.observe_button(
-                        tele_data.right_ctrl_bButton
-                    )
-                    if b_button_fired and not HAND_EYE_CAPTURE.follow_enabled:
-                        HAND_EYE_CAPTURE.consume_toggle()
+                if not replay_mode:
+                    # Controller B queues a toggle on its rising edge; keyboard
+                    # 'c' and the web "锁定并采样" button queue the same toggle
+                    # via IPC. All sources share one pending-toggle slot.
+                    if args.input_mode == "controller":
+                        HAND_EYE_CAPTURE.observe_button(
+                            tele_data.right_ctrl_bButton
+                        )
+                    if (
+                        not HAND_EYE_CAPTURE.follow_enabled
+                        and HAND_EYE_CAPTURE.consume_toggle()
+                    ):
                         if not tele_data.motion_data_ready:
                             logger_mp.warning(
                                 "Initial follow request ignored: XR motion data is not ready."
@@ -1319,7 +1325,10 @@ if __name__ == '__main__':
                                     "target_q": resume_q.copy(),
                                     "start_time": time.monotonic(),
                                     "duration": max(args.hand_eye_resume_seconds, 0.1),
-                                    "record_event": True,
+                                    "record_event": bool(
+                                        trajectory_recorder is not None
+                                        and trajectory_recorder.has_open_event
+                                    ),
                                 }
                                 HAND_EYE_CAPTURE.begin_resume()
                                 tv_wrapper.clear_depth_preview()
