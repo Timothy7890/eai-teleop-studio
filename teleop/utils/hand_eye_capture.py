@@ -158,6 +158,19 @@ class HandEyeCaptureState:
                 raise RuntimeError(f"cannot enable follow from {self._state}")
             self._follow_enabled = True
 
+    def enable_follow_with_resume(self) -> None:
+        """Enable follow but enter RESUMING first.
+
+        Used on the first B press so the arm glides from its current pose to
+        the controller's absolute pose instead of snapping there at full speed.
+        """
+        with self._lock:
+            if self._state != FOLLOW:
+                raise RuntimeError(f"cannot enable follow from {self._state}")
+            self._follow_enabled = True
+            self._state = RESUMING
+            self._error = None
+
     def observe_button(self, pressed: bool) -> bool:
         """Queue one toggle on a rising edge and return whether it fired."""
         with self._lock:

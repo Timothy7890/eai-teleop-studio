@@ -73,6 +73,15 @@ class HandEyeCaptureStateTest(unittest.TestCase):
         self.assertEqual(snapshot["HAND_EYE_SETTLING_RAW_DQ"], 2.0)
         self.assertEqual(snapshot["HAND_EYE_SETTLING_WINDOW_SPEED"], 0.0)
 
+    def test_enable_follow_with_resume_glides_before_following(self):
+        state = HandEyeCaptureState()
+        state.enable_follow_with_resume()
+        self.assertTrue(state.follow_enabled)
+        self.assertEqual(state.state, RESUMING)
+        state.finish_resume()
+        self.assertEqual(state.state, FOLLOW)
+        self.assertTrue(state.follow_enabled)
+
     def test_hold_for_safety_latches_hold_without_capture(self):
         state = HandEyeCaptureState()
         state.enable_follow()

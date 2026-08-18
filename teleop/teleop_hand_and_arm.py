@@ -1050,7 +1050,6 @@ if __name__ == '__main__':
         arm_trace_last_log = 0.0
         arm_trace_start_q = None
         loco_last_warning_time = 0.0
-        motion_ready_prev = False
 
         # main loop. robot start to follow VR user's motion
         while not STOP:
@@ -1127,17 +1126,19 @@ if __name__ == '__main__':
             if arm_trace_start_q is None:
                 arm_trace_start_q = current_lr_arm_q.copy()
 
-            # XR link watchdog: if motion data goes stale mid-follow (headset
+            # XR link watchdog: if motion data is stale mid-follow (headset
             # websocket dropped), latch HOLD at the current measured joints.
             # Without this, the IK target would jump to wherever the controller
             # is on reconnect and the arm would snap there at full speed.
+            # hold_for_safety only fires from active FOLLOW, so repeated calls
+            # while the link stays down are no-ops.
             if (
                 args.hand_eye_record
                 and HAND_EYE_REPLAY is None
-                and motion_ready_prev
                 and not tele_data.motion_data_ready
                 and HAND_EYE_CAPTURE.follow_enabled
                 and HAND_EYE_CAPTURE.state == HAND_EYE_FOLLOW
+                and hand_eye_resume_transition is None
             ):
                 safety_hold_q = np.concatenate([left_fixed_q, current_lr_arm_q[-7:]])
                 if HAND_EYE_CAPTURE.hold_for_safety(
@@ -1149,7 +1150,6 @@ if __name__ == '__main__':
                         "current measured joints to prevent a reconnect jump. "
                         "Press B after the headset reconnects to resume smoothly."
                     )
-            motion_ready_prev = tele_data.motion_data_ready
 
             hand_eye_holding = False
             if args.hand_eye_record:
@@ -1193,15 +1193,50 @@ if __name__ == '__main__':
                                 "Initial follow request ignored: XR motion data is not ready."
                             )
                         else:
-                            initial_solution_q = np.concatenate([
-                                left_fixed_q,
-                                current_lr_arm_q[-7:],
-                            ])
-                            arm_ik.reset_solution(initial_solution_q)
-                            HAND_EYE_CAPTURE.enable_follow()
-                            logger_mp.info(
-                                "Hand-eye absolute XR-to-IK follow enabled by first B press."
-                            )
+                            # Absolute follow means the IK target becomes the
+                            # controller's current pose the instant follow is
+                            # enabled. Glide there through the same smooth
+                            # RESUMING transition used after HOLD instead of
+                            # snapping at full speed.
+                            try:
+                                initial_solution_q = np.concatenate([
+                                    left_fixed_q,
+                                    current_lr_arm_q[-7:],
+                                ])
+                                arm_ik.reset_solution(initial_solution_q)
+                                initial_target_q, _ = arm_ik.solve_ik(
+                                    left_fixed_wrist_pose,
+                                    tele_data.right_wrist_pose,
+                                    initial_solution_q,
+                                    np.zeros_like(initial_solution_q),
+                                )
+                                initial_target_q[:7] = left_fixed_q
+                                if not np.all(np.isfinite(initial_target_q)):
+                                    raise RuntimeError(
+                                        "initial follow IK returned non-finite joints"
+                                    )
+                                initial_delta = float(
+                                    np.max(np.abs(initial_target_q - initial_solution_q))
+                                )
+                                hand_eye_resume_transition = {
+                                    "start_q": current_lr_arm_q.copy(),
+                                    "target_q": initial_target_q.copy(),
+                                    "start_time": time.monotonic(),
+                                    "duration": max(args.hand_eye_resume_seconds, 0.1),
+                                    "record_event": False,
+                                }
+                                HAND_EYE_CAPTURE.enable_follow_with_resume()
+                                logger_mp.info(
+                                    "Hand-eye absolute follow enabled by first B press; "
+                                    "smoothly moving to controller pose first "
+                                    f"(joint_delta={initial_delta:.5f} rad, "
+                                    f"duration={hand_eye_resume_transition['duration']:.2f}s)."
+                                )
+                            except Exception as exc:
+                                hand_eye_resume_transition = None
+                                logger_mp.error(
+                                    f"Initial follow IK failed; follow not enabled: {exc}"
+                                )
                 if (
                     not replay_mode
                     and HAND_EYE_CAPTURE.follow_enabled
@@ -1270,6 +1305,7 @@ if __name__ == '__main__':
                                     "target_q": resume_q.copy(),
                                     "start_time": time.monotonic(),
                                     "duration": max(args.hand_eye_resume_seconds, 0.1),
+                                    "record_event": True,
                                 }
                                 HAND_EYE_CAPTURE.begin_resume()
                                 tv_wrapper.clear_depth_preview()
@@ -1515,7 +1551,10 @@ if __name__ == '__main__':
                 if progress >= 1.0:
                     arm_ik.reset_solution(transition_target_q)
                     HAND_EYE_CAPTURE.finish_resume()
-                    if trajectory_recorder is not None:
+                    if (
+                        trajectory_recorder is not None
+                        and hand_eye_resume_transition.get("record_event", True)
+                    ):
                         last_frame_index = trajectory_recorder.last_frame_index
                         next_frame_index = (
                             -1 if last_frame_index is None else last_frame_index
