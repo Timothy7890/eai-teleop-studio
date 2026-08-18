@@ -159,6 +159,10 @@ class TeleVuer:
         self.left_arm_pose_shared = Array('d', 16, lock=True)
         self.right_arm_pose_shared = Array('d', 16, lock=True)
         self.motion_data_ready_shared = Value('b', False, lock=True)
+        # monotonic timestamp of the last motion event; lets consumers detect
+        # a stale/frozen XR link (websocket dropped) instead of trusting the
+        # latched motion_data_ready flag forever.
+        self.motion_data_time_shared = Value('d', 0.0, lock=True)
         if self.use_hand_tracking:
             self.left_hand_position_shared = Array('d', 75, lock=True)
             self.right_hand_position_shared = Array('d', 75, lock=True)
@@ -497,6 +501,8 @@ class TeleVuer:
             extract_controllers(right_controller, "right")
             with self.motion_data_ready_shared.get_lock():
                 self.motion_data_ready_shared.value = True
+            with self.motion_data_time_shared.get_lock():
+                self.motion_data_time_shared.value = time.monotonic()
         except Exception as exc:
             now = time.monotonic()
             if now - self._controller_move_error_log_time >= 1.0:
@@ -601,6 +607,8 @@ class TeleVuer:
             if left_valid or right_valid:
                 with self.motion_data_ready_shared.get_lock():
                     self.motion_data_ready_shared.value = True
+                with self.motion_data_time_shared.get_lock():
+                    self.motion_data_time_shared.value = time.monotonic()
 
         except Exception as exc:
             now = time.monotonic()
@@ -1173,3 +1181,12 @@ class TeleVuer:
         """bool, whether at least one hand or controller motion data event has been received."""
         with self.motion_data_ready_shared.get_lock():
             return self.motion_data_ready_shared.value
+
+    @property
+    def motion_data_age(self):
+        """float, seconds since the last motion event (inf if none received yet)."""
+        with self.motion_data_time_shared.get_lock():
+            last = self.motion_data_time_shared.value
+        if last <= 0.0:
+            return float("inf")
+        return time.monotonic() - last

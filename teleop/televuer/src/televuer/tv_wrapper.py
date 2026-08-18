@@ -230,7 +230,8 @@ class TeleVuerWrapper:
     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=(480, 1280), display_fps: float=30.0,
                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
                        cert_file: str=None, key_file: str=None, return_hand_rot_data: bool=False,
-                       arm_reference_mode: Literal["world", "head_position", "head_yaw"]="head_yaw"):
+                       arm_reference_mode: Literal["world", "head_position", "head_yaw"]="head_yaw",
+                       motion_stale_after_s: float=0.5):
         """
         TeleVuerWrapper is a wrapper for the TeleVuer class, which handles XR device's data suit for robot control.
         It initializes the TeleVuer instance with the specified parameters and provides a method to get motion state data.
@@ -278,10 +279,23 @@ class TeleVuerWrapper:
         self.use_hand_tracking = use_hand_tracking
         self.return_hand_rot_data = return_hand_rot_data
         self.arm_reference_mode = arm_reference_mode
+        self.motion_stale_after_s = float(motion_stale_after_s)
         self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
                               display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url, 
                               cert_file=cert_file, key_file=key_file)
         
+    def _motion_data_fresh(self) -> bool:
+        """True only if motion data has arrived and is not stale.
+
+        The raw ``motion_data_ready`` flag latches True forever after the first
+        motion event, so a dropped XR websocket would otherwise keep feeding
+        frozen poses to control as if they were live.
+        """
+        return (
+            self.tvuer.motion_data_ready
+            and self.tvuer.motion_data_age <= self.motion_stale_after_s
+        )
+
     def get_tele_data(self):
         """
         Get processed motion state data from the TeleVuer instance.
@@ -404,7 +418,7 @@ class TeleVuerWrapper:
                 right_hand_pos=right_IPunitree_Brobot_arm_hand_pos,
                 left_hand_rot=left_Brobot_arm_hand_rot,
                 right_hand_rot=right_Brobot_arm_hand_rot,
-                motion_data_ready=self.tvuer.motion_data_ready,
+                motion_data_ready=self._motion_data_fresh(),
                 left_hand_pinch=self.tvuer.left_hand_pinch,
                 left_hand_pinchValue=self.tvuer.left_hand_pinchValue * 100.0,
                 left_hand_squeeze=self.tvuer.left_hand_squeeze,
@@ -435,7 +449,7 @@ class TeleVuerWrapper:
                 head_pose=Brobot_world_head,
                 left_wrist_pose=left_IPunitree_Brobot_waist_arm,
                 right_wrist_pose=right_IPunitree_Brobot_waist_arm,
-                motion_data_ready=self.tvuer.motion_data_ready,
+                motion_data_ready=self._motion_data_fresh(),
                 left_ctrl_trigger=self.tvuer.left_ctrl_trigger,
                 left_ctrl_triggerValue=10.0 - self.tvuer.left_ctrl_triggerValue * 10,
                 left_ctrl_squeeze=self.tvuer.left_ctrl_squeeze,

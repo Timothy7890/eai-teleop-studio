@@ -1022,21 +1022,27 @@ if __name__ == '__main__':
                     if head_img is not None and head_img.bgr is not None:
                         tv_wrapper.render_to_xr(head_img.bgr)
 
-        # A may still be held after starting. Require a release and a new
-        # rising edge before treating A as an exit request.
-        a_button_was_pressed = bool(
-            args.input_mode == "controller"
-            and tele_data.motion_data_ready
-            and tele_data.right_ctrl_aButton
-        )
-        if args.hand_eye_record and args.input_mode == "controller":
-            HAND_EYE_CAPTURE.observe_button(
-                bool(tele_data.motion_data_ready and tele_data.right_ctrl_bButton)
+        if STOP:
+            # The wait loop can also exit because STOP was requested (web UI /
+            # keyboard) before START. Never announce or arm tracking then; fall
+            # through so the finally-block moves the arms to the safe exit pose.
+            logger_mp.info("Stop requested before tracking started; skipping tracking loop.")
+        else:
+            # A may still be held after starting. Require a release and a new
+            # rising edge before treating A as an exit request.
+            a_button_was_pressed = bool(
+                args.input_mode == "controller"
+                and tele_data.motion_data_ready
+                and tele_data.right_ctrl_aButton
             )
-            HAND_EYE_CAPTURE.consume_toggle()
-        logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
-        update_vr_hud(tv_wrapper, started=True, motion_ready=False)
-        arm_ctrl.speed_gradual_max()
+            if args.hand_eye_record and args.input_mode == "controller":
+                HAND_EYE_CAPTURE.observe_button(
+                    bool(tele_data.motion_data_ready and tele_data.right_ctrl_bButton)
+                )
+                HAND_EYE_CAPTURE.consume_toggle()
+            logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
+            update_vr_hud(tv_wrapper, started=True, motion_ready=False)
+            arm_ctrl.speed_gradual_max()
 
         image_frames = {camera_name: None for camera_name in record_camera_names}
         continuous_record = args.record and not args.hand_eye_record
@@ -1044,6 +1050,7 @@ if __name__ == '__main__':
         arm_trace_last_log = 0.0
         arm_trace_start_q = None
         loco_last_warning_time = 0.0
+        motion_ready_prev = False
 
         # main loop. robot start to follow VR user's motion
         while not STOP:
@@ -1119,6 +1126,30 @@ if __name__ == '__main__':
             current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
             if arm_trace_start_q is None:
                 arm_trace_start_q = current_lr_arm_q.copy()
+
+            # XR link watchdog: if motion data goes stale mid-follow (headset
+            # websocket dropped), latch HOLD at the current measured joints.
+            # Without this, the IK target would jump to wherever the controller
+            # is on reconnect and the arm would snap there at full speed.
+            if (
+                args.hand_eye_record
+                and HAND_EYE_REPLAY is None
+                and motion_ready_prev
+                and not tele_data.motion_data_ready
+                and HAND_EYE_CAPTURE.follow_enabled
+                and HAND_EYE_CAPTURE.state == HAND_EYE_FOLLOW
+            ):
+                safety_hold_q = np.concatenate([left_fixed_q, current_lr_arm_q[-7:]])
+                if HAND_EYE_CAPTURE.hold_for_safety(
+                    safety_hold_q,
+                    "XR 手柄数据中断，已锁定当前姿态；重连后按 B 平滑恢复跟随。",
+                ):
+                    logger_mp.warning(
+                        "XR motion data went stale while following; latched HOLD at "
+                        "current measured joints to prevent a reconnect jump. "
+                        "Press B after the headset reconnects to resume smoothly."
+                    )
+            motion_ready_prev = tele_data.motion_data_ready
 
             hand_eye_holding = False
             if args.hand_eye_record:

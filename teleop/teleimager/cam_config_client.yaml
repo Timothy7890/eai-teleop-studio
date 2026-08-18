@@ -26,7 +26,7 @@ head_rgbd_camera:
   data_format: rgbd
   color_camera: head_camera
   depth_dtype: uint16
-  fps: 30
+  fps: 10
   depth:
     type: opencv_depth
     data_format: depth_z16

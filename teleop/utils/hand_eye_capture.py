@@ -197,6 +197,29 @@ class HandEyeCaptureState:
             self._settling_progress = 0.0
             self._settling_blocker = "collecting_window"
 
+    def hold_for_safety(self, current_q: np.ndarray, message: str) -> bool:
+        """Latch HOLD at the given joints when XR input is lost mid-follow.
+
+        Unlike ``begin_hold`` this does not enter SETTLING (no capture is
+        triggered).  The operator must press B after XR reconnects, which goes
+        through the smooth RESUMING transition instead of letting the IK
+        target jump to wherever the controller ended up.
+        """
+        q = np.asarray(current_q, dtype=float)
+        if q.shape != (14,) or not np.all(np.isfinite(q)):
+            return False
+        with self._lock:
+            if self._state != FOLLOW or not self._follow_enabled:
+                return False
+            self._hold_q = q.copy()
+            self._state = HOLD
+            self._error = str(message)
+            self._fatal_error = False
+            self._stable_since = None
+            self._q_history.clear()
+            self._captured_frames = 0
+            return True
+
     def check_hold_drift(self, current_q: np.ndarray) -> bool:
         """Latch a fatal HOLD error if measured joints leave the commanded hold pose."""
         q = np.asarray(current_q, dtype=float)

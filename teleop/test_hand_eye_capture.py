@@ -73,6 +73,36 @@ class HandEyeCaptureStateTest(unittest.TestCase):
         self.assertEqual(snapshot["HAND_EYE_SETTLING_RAW_DQ"], 2.0)
         self.assertEqual(snapshot["HAND_EYE_SETTLING_WINDOW_SPEED"], 0.0)
 
+    def test_hold_for_safety_latches_hold_without_capture(self):
+        state = HandEyeCaptureState()
+        state.enable_follow()
+        q = np.linspace(0.0, 0.13, 14)
+        self.assertTrue(state.hold_for_safety(q, "XR link lost"))
+        self.assertEqual(state.state, HOLD)
+        self.assertFalse(state.fatal_error)
+        np.testing.assert_allclose(state.hold_q, q)
+        self.assertEqual(state.snapshot()["HAND_EYE_ERROR"], "XR link lost")
+        # Not fatal: the normal HOLD -> RESUMING -> FOLLOW path must still work.
+        state.begin_resume()
+        state.finish_resume()
+        self.assertEqual(state.state, FOLLOW)
+
+    def test_hold_for_safety_requires_active_follow(self):
+        state = HandEyeCaptureState()
+        # follow not enabled yet
+        self.assertFalse(state.hold_for_safety(np.zeros(14), "XR link lost"))
+        self.assertEqual(state.state, FOLLOW)
+        # already holding
+        state.enable_follow()
+        state.begin_hold(np.zeros(14), now=0.0)
+        self.assertFalse(state.hold_for_safety(np.zeros(14), "XR link lost"))
+        # invalid joints are rejected
+        state2 = HandEyeCaptureState()
+        state2.enable_follow()
+        bad_q = np.full(14, np.nan)
+        self.assertFalse(state2.hold_for_safety(bad_q, "XR link lost"))
+        self.assertEqual(state2.state, FOLLOW)
+
     def test_hold_drift_is_fatal_and_blocks_capture(self):
         state = HandEyeCaptureState(max_hold_error=0.05)
         state.begin_hold(np.zeros(14), now=0.0)
